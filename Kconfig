@@ -1,0 +1,10 @@
+#
+# Imagination Wireless drivers
+#
+
+config UCCP420WLAN
+	tristate "Imagination UCCP420 WLAN"
+	depends on MAC80211 && CFG80211
+
+	---help---
+          Imagination technologies UCCP420 WLAN driver
