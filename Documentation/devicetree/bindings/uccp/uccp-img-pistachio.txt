@@ -1,0 +1,73 @@
+IMG UCCP420 driver properties
+
+Required Properties:
+- compatible: "img,pistachio-uccp"
+- reg: RPU registers
+- reg-names : Should containt the names of the registers used by the driver
+- interrupts: Interrupt number used by the RPU
+- clocks : Should contain a clock specifier for each entry in clock-names
+- clock-names : Should contain the clock names used by the driver
+- io-channels : Names of the channels used by the driver
+
+Example:
+
+wifi: uccp@18480000 {
+	      status = "disabled";
+	      compatible = "img,pistachio-uccp";
+	      reg = <0x18480000 0x38000>, <0x184BC000 0x2800>, <0x1a000000 0x00066cc0>;
+	      reg-names = "uccp_core_base", "uccp_slave_base" , "uccp_pkd_gram_base";
+	      interrupts = <GIC_SHARED 67 IRQ_TYPE_LEVEL_HIGH>;
+	      interrupt-names = "uccpirq";
+	      clocks = <&clk_core CLK_RPU_CORE>,
+		     <&clk_core CLK_RPU_CORE_DIV>,
+		     <&clk_core CLK_RPU_V>,
+		     <&clk_core CLK_RPU_L>,
+		     <&clk_core CLK_RPU_SLEEP>,
+		     <&clk_core CLK_WIFI_PLL>,
+		     <&clk_core CLK_WIFI_ADC>,
+		     <&clk_core CLK_WIFI_DAC>,
+		     <&clk_core CLK_EVENT_TIMER>,
+		     <&cr_periph SYS_CLK_EVENT_TIMER>,
+		     <&clk_core CLK_AUX_ADC>,
+		     <&clk_core CLK_AUX_ADC_INTERNAL>;
+	      clock-names = "rpu_core", "rpu_core_div", "rpu_v", "rpu_l", "rpu_sleep",
+		      "wifi_pll", "wifi_adc", "wifi_dac", "event_timer",
+		      "sys_event_timer", "aux_adc", "aux_adc_internal";
+	      assigned-clocks = <&clk_core CLK_RPU_L_DIV>,
+		      <&clk_core CLK_RPU_L_MUX>,
+		      <&clk_core CLK_RPU_L_PLL_MUX>,
+		      <&clk_core CLK_RPU_V_DIV>,
+		      <&clk_core CLK_RPU_V_PLL_MUX>,
+		      <&clk_core CLK_RPU_CORE_DIV>,
+		      <&clk_core CLK_WIFI_PLL_MUX>,
+		      <&clk_core CLK_WIFI_DIV4_MUX>,
+		      <&clk_core CLK_WIFI_DIV8_MUX>,
+		      <&clk_core CLK_RPU_SLEEP_DIV>,
+		      <&clk_core CLK_WIFI_PLL>,
+		      <&clk_core CLK_RPU_CORE>;
+	      assigned-clock-parents = <0>,
+		      <&clk_core CLK_RPU_L_PLL_MUX>,
+		      <&clk_core CLK_RPU_L_PLL>,
+		      <0>,
+		      <&clk_core CLK_RPU_V_PLL>,
+		      <0>,
+		      <&clk_core CLK_WIFI_PLL>,
+		      <&clk_core CLK_WIFI_DIV4>,
+		      <&clk_core CLK_WIFI_DIV8>,
+		      <0>,
+		      <0>,
+		      <0>;
+	      assigned-clock-rates = <559000000>,
+		      <0>,
+		      <0>,
+		      <598000000>,
+		      <0>,
+		      <320000000>,
+		      <0>,
+		      <0>,
+		      <0>,
+		      <52000>,
+		      <320000000>,
+		      <320000000>;
+	      io-channels = <&adc 4>, <&adc 5>;
+      };

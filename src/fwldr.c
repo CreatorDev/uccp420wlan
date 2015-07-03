@@ -162,8 +162,6 @@ static void dir_mem_cpy(unsigned int addr,
 					      __func__, base);
 		}
 	}
-
-	return;
 }
 
 
@@ -228,8 +226,6 @@ static void dir_mem_set(unsigned int addr,
 				      __func__, base);
 		}
 	}
-
-	return;
 }
 
 /* Perform 'len' 32 bit reads from a UCCP memory location 'addr'
@@ -822,7 +818,6 @@ static int fwldr_parser(const unsigned char *fw_data)
 					 GFP_KERNEL);
 
 			if (l2_blk == NULL) {
-				fwldr_dbg_err("Not Enough Memory\n");
 				res = FWLDR_FAIL;
 				break;
 			}
@@ -949,9 +944,7 @@ static int fwldr_parser(const unsigned char *fw_data)
 
 			cfg_str = kmalloc(buf_len, GFP_KERNEL);
 
-			if (cfg_str == NULL) {
-				fwldr_dbg_err("Failed to allocate cfg_str\n");
-			} else {
+			if (cfg_str) {
 				str_curr = cfg_str;
 				str_end = cfg_str + buf_len;
 			}

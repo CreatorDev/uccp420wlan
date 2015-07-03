@@ -42,6 +42,7 @@
 #include <linux/atomic.h>
 #include <linux/etherdevice.h>
 
+#include "host_umac_if.h"
 #include "umac_if.h"
 #include "descriptors.h"
 
@@ -67,6 +68,12 @@ extern spinlock_t tsf_lock;
 #define DEBUG_LOG(...) do { } while (0)
 #endif
 
+#ifdef CONFIG_MULTI_CHAN_DEBUG
+#define MULTI_CHAN_DEBUG(fmt, args...) pr_debug(fmt, ##args)
+#else
+#define MULTI_CHAN_DEBUG(...) do { } while (0)
+#endif
+
 #define MAX_OUTSTANDING_CTRL_REQ 2
 #define RESET_TIMEOUT 5000   /* In milli-seconds*/
 #define RESET_TIMEOUT_TICKS msecs_to_jiffies(RESET_TIMEOUT)
@@ -85,7 +92,6 @@ extern spinlock_t tsf_lock;
 #define SCAN_ABORT_TIMEOUT_TICKS msecs_to_jiffies(SCAN_ABORT_TIMEOUT)
 
 
-#define MAX_VIFS 2
 #define DEFAULT_TX_ANT_SELECT 3 /* bitmap of antennas for tx, 3=> both first and
 				 * second antenna to be used
 				 */
@@ -104,9 +110,8 @@ extern spinlock_t tsf_lock;
 #define   MAX_RSSI_SAMPLES 10
 
 #define CLOCK_MASK 0x3FFFFFFF
-#define TICK_NUMRATOR 1000 /* 1 MHz */
-#define TICK_DENOMINATOR 12288 /* 12288000 Hz */
-
+#define TICK_NUMRATOR 12288 /* 12288 KHz  */
+#define TICK_DENOMINATOR 1000 /* 1000 KHz */
 
 enum noa_triggers {
 	FROM_TX = 0,
@@ -376,6 +381,14 @@ struct wifi_stats {
 	unsigned char rf_calib_data[MAX_RF_CALIB_DATA];
 };
 
+
+struct tx_pkt_info {
+	struct sk_buff_head pkt;
+	unsigned int hdr_len;
+	unsigned int queue;
+};
+
+
 struct tx_config {
 	/* Used to protect the TX pool */
 	spinlock_t lock;
@@ -390,13 +403,28 @@ struct tx_config {
 	unsigned int next_spare_token_ac;
 
 	/* Used to store the address of pending skbs per ac */
+#ifdef UNIFORM_BW_SHARING
+	struct sk_buff_head pending_pkt[MAX_PEND_Q_PER_AC][NUM_ACS];
+
+#ifdef MULTI_CHAN_SUPPORT
+	/* Peer which has the opportunity to xmit next on a queue */
+	unsigned int curr_peer_opp[MAX_CHANCTX][NUM_ACS];
+#else
+	unsigned int curr_peer_opp[NUM_ACS];
+#endif
+#else
 	struct sk_buff_head pending_pkt[NUM_ACS];
+#endif
 
 	/* Used to store the address of tx'ed skb and len of 802.11 hdr
 	 * it will be used in tx complete.
 	 */
-	struct sk_buff_head tx_pkt[NUM_TX_DESCS];
-	unsigned int tx_pkt_hdr_len[NUM_TX_DESCS];
+#ifdef MULTI_CHAN_SUPPORT
+	unsigned char desc_chan_map[NUM_TX_DESCS];
+	struct tx_pkt_info pkt_info[MAX_CHANCTX][NUM_TX_DESCS];
+#else
+	struct tx_pkt_info pkt_info[NUM_TX_DESCS];
+#endif
 
 	unsigned int queue_stopped_bmp;
 	struct sk_buff_head proc_tx_list[NUM_TX_DESCS];
@@ -444,6 +472,7 @@ struct roc_params {
 	unsigned char roc_chan_changed;
 	atomic_t roc_mgmt_tx_count;
 };
+
 struct mac80211_dev {
 	struct proc_dir_entry *umac_proc_dir_entry;
 	struct device *dev;
@@ -478,6 +507,9 @@ struct mac80211_dev {
 			 * STA mode is active
 			 */
 	struct ieee80211_vif *vifs[MAX_VIFS];
+#ifdef UNIFORM_BW_SHARING
+	struct ieee80211_sta *peers[MAX_PEERS];
+#endif
 	struct ieee80211_hw *hw;
 	struct sta_tid_info  tid_info[32];
 	spinlock_t bcast_lock; /* Used to ensure more_frames bit is set properly
@@ -487,6 +519,12 @@ struct mac80211_dev {
 	unsigned char tx_antenna;
 	unsigned char tx_last_beacon;
 	unsigned int rts_threshold;
+#ifdef MULTI_CHAN_SUPPORT
+	spinlock_t chanctx_lock;
+	struct ieee80211_chanctx_conf *chanctx[MAX_CHANCTX];
+	int curr_chanctx_idx;
+	int num_active_chanctx;
+#endif
 };
 
 struct edca_params {
@@ -521,13 +559,41 @@ struct umac_vif {
 
 	/*Global Sequence no for non-qos and mgmt frames/vif*/
 	__u16 seq_no;
+
+#ifdef MULTI_CHAN_SUPPORT
+	struct list_head list;
+	struct umac_chanctx *chanctx;
+#endif
 };
+
+#ifdef UNIFORM_BW_SHARING
+struct umac_sta {
+	int index;
+#ifdef MULTI_CHAN_SUPPORT
+	struct umac_chanctx *chanctx;
+#endif
+};
+#endif
+
+#ifdef MULTI_CHAN_SUPPORT
+struct umac_chanctx {
+	int index;
+
+	struct list_head vifs;
+	short nvifs;
+};
+
+#endif
 
 
 extern int wait_for_scan_abort(struct mac80211_dev *dev);
 extern int wait_for_channel_prog_complete(struct mac80211_dev *dev);
 extern int uccp420wlan_prog_nw_selection(unsigned int nw_select_enabled,
 					 unsigned char *mac_addr);
+#ifdef MULTI_CHAN_SUPPORT
+void uccp420wlan_proc_ch_sw_event(struct umac_event_ch_switch *ch_sw_info,
+				  void *context);
+#endif
 extern int  uccp420wlan_core_init(struct mac80211_dev *dev, unsigned int ftm);
 extern void uccp420wlan_core_deinit(struct mac80211_dev *dev, unsigned int ftm);
 extern void uccp420wlan_vif_add(struct umac_vif  *uvif);
@@ -541,12 +607,27 @@ extern void uccp420wlan_vif_bss_info_changed(struct umac_vif *uvif,
 					     *bss_conf, unsigned int changed);
 extern int  uccp420wlan_tx_frame(struct sk_buff *skb, struct ieee80211_sta *sta,
 				 struct mac80211_dev *dev, bool bcast);
+extern int __uccp420wlan_tx_frame(struct mac80211_dev *dev,
+				  unsigned int queue,
+				  unsigned int token_id,
+				  unsigned int more_frames);
 extern void uccp420wlan_tx_init(struct mac80211_dev *dev);
 extern void uccp420wlan_tx_deinit(struct mac80211_dev *dev);
 
 extern void proc_bss_info_changed(unsigned char *mac_addr, int value);
 extern void packet_generation(unsigned long data);
 extern int wait_for_reset_complete(struct mac80211_dev *dev);
+
+extern void uccp420wlan_tx_proc_pend_frms(struct mac80211_dev *dev,
+				   int queue,
+#ifdef UNIFORM_BW_SHARING
+				   int peer_id,
+#endif
+				   int token_id);
+#ifdef UNIFORM_BW_SHARING
+int get_curr_peer_opp(struct mac80211_dev *dev,
+		      int queue);
+#endif
 
 /* Beacon TimeStamp */
 __s32 __attribute__((weak)) frc_to_atu(__u32 frccnt, __u64 *patu, s32 dir);
@@ -561,6 +642,7 @@ static inline int vif_addr_to_index(unsigned char *addr,
 				    struct mac80211_dev *dev)
 {
 	int i;
+
 	for (i = 0; i < MAX_VIFS; i++)
 		if (ether_addr_equal(addr, dev->if_mac_addresses[i].addr))
 			break;

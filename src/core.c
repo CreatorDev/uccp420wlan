@@ -30,7 +30,7 @@
 
 spinlock_t tsf_lock;
 
-unsigned char bss_addr[6] = {72, 14, 29 , 35, 31, 52};
+unsigned char bss_addr[6] = {72, 14, 29, 35, 31, 52};
 static int is_robust_mgmt(struct sk_buff *skb)
 {
 	/*TODO: mmie struture not being used now. Uncomment once in use */
@@ -56,6 +56,7 @@ static int is_robust_mgmt(struct sk_buff *skb)
 		if (((hdr->frame_control & IEEE80211_FCTL_STYPE) ==
 			IEEE80211_STYPE_ACTION)) {
 			u8 *category;
+
 			category = ((u8 *) hdr) + 24;
 
 			if (*category == WLAN_CATEGORY_PUBLIC ||
@@ -90,6 +91,7 @@ static int is_robust_mgmt(struct sk_buff *skb)
 int wait_for_scan_abort(struct mac80211_dev *dev)
 {
 	int count;
+
 	count = 0;
 
 check_scan_abort_complete:
@@ -119,6 +121,7 @@ check_scan_abort_complete:
 int wait_for_channel_prog_complete(struct mac80211_dev *dev)
 {
 	int count;
+
 	count = 0;
 
 check_ch_prog_complete:
@@ -148,6 +151,7 @@ check_ch_prog_complete:
 int wait_for_reset_complete(struct mac80211_dev *dev)
 {
 	int count;
+
 	count = 0;
 
 check_reset_complete:
@@ -207,6 +211,7 @@ static void driver_tput_timer_expiry(unsigned long data)
 void proc_bss_info_changed(unsigned char *mac_addr, int value)
 {
 		int temp = 0, i = 0, j = 0;
+
 		get_random_bytes(&j, sizeof(j));
 		for (i = 5; i > 0; i--) {
 			j = j % (i+1);
@@ -224,7 +229,7 @@ void packet_generation(unsigned long data)
 		unsigned char *mac_addr = dev->if_mac_addresses[0].addr;
 		struct ieee80211_hdr hdr = {0};
 		struct sk_buff *skb;
-		unsigned char broad_addr[6] = {0xff, 0xff, 0xff ,
+		unsigned char broad_addr[6] = {0xff, 0xff, 0xff,
 					       0xff, 0xff, 0xff};
 		u16 hdrlen = 26;
 
@@ -239,7 +244,7 @@ void packet_generation(unsigned long data)
 		hdr.frame_control = cpu_to_le16(IEEE80211_FTYPE_DATA |
 						IEEE80211_STYPE_QOS_DATA);
 		memcpy(skb_put(skb, hdrlen), &hdr, hdrlen);
-		memset(skb_put(skb, dev->params->payload_length), 0xAB ,
+		memset(skb_put(skb, dev->params->payload_length), 0xAB,
 			dev->params->payload_length);
 
 		/*LOOP_END*/
@@ -380,8 +385,6 @@ void uccp420wlan_core_deinit(struct mac80211_dev *dev, unsigned int ftm)
 	hal_ops.deinit_bufs();
 
 	uccp420wlan_lmac_if_deinit();
-
-	return;
 }
 
 
@@ -782,6 +785,7 @@ void uccp420wlan_vif_bss_info_changed(struct umac_vif *uvif,
 void uccp420wlan_reset_complete(char *lmac_version, void *context)
 {
 	struct mac80211_dev *dev = (struct mac80211_dev *)context;
+
 	memcpy(dev->stats->uccp420_lmac_version, lmac_version, 5);
 	dev->stats->uccp420_lmac_version[5] = '\0';
 	dev->reset_complete = 1;
@@ -968,17 +972,14 @@ void uccp420wlan_noa_event(int event, struct umac_event_noa *noa, void *context,
 
 	if (transmit)
 		uccp420wlan_tx_frame(skb, NULL, dev, false);
-
-	return;
 }
 
+#if 0
 /* Beacon Time Stamp */
-static unsigned int get_real_ts2(unsigned int t2,
-					unsigned long long t1,
-					unsigned long long t3)
+static unsigned int get_real_ts2(unsigned int t2, unsigned int delta)
 {
-	unsigned long long t;
-	int td;
+	unsigned int td = 0;
+	unsigned int clocks = 0;
 	unsigned int clock_mask = 0, tck_num = 0, tck_denom = 0;
 
 	if (get_evt_timer_freq) {
@@ -989,22 +990,189 @@ static unsigned int get_real_ts2(unsigned int t2,
 		tck_denom = TICK_DENOMINATOR;
 	}
 
-	if (t3 >= t1) {
-		t = t3 - t1;
-	} else {
-		t = t1 - t3;
-		t = ULLONG_MAX - t + 1;
-	}
+	clocks = delta * tck_num;
+	/* clocks = clocks / tck_denom; */
+	do_div(clocks, tck_denom);
 
-	t *= tck_num;
-	do_div(t, tck_denom);
-	td = t2 - (int32_t)t;
-
-	if (td < 0)
-		td = clock_mask + 1 + td;
+	if (t2 >= clocks)
+		td = t2 - clocks;
+	else
+		td = clock_mask + (t2 + 1) - clocks;
 
 	return td & clock_mask;
 }
+#endif
+
+
+#ifdef MULTI_CHAN_SUPPORT
+void uccp420wlan_proc_ch_sw_event(struct umac_event_ch_switch *ch_sw_info,
+				  void *context)
+{
+	struct mac80211_dev *dev = NULL;
+	int chan = 0;
+	int curr_freq = 0;
+	int chan_id = 0;
+	struct sk_buff_head *txq = NULL;
+	int txq_len = 0;
+	int i = 0;
+	int queue = 0;
+	unsigned long flags = 0;
+	int curr_bit = 0;
+	int pool_id = 0;
+	int ret = 0;
+#ifdef UNIFORM_BW_SHARING
+	int peer_id = -1;
+#else
+	int pkts_pend = 0;
+#endif
+	int ac = 0;
+	struct ieee80211_chanctx_conf *curr_chanctx = NULL;
+	struct tx_config *tx = NULL;
+
+	if (!ch_sw_info || !context) {
+		pr_err("%s: Invalid Parameters\n", __func__);
+		return;
+	}
+
+	dev = (struct mac80211_dev *)context;
+	chan = ch_sw_info->chan;
+	tx = &dev->tx;
+
+	rcu_read_lock();
+
+	for (i = 0; i < MAX_CHANCTX; i++) {
+		curr_chanctx = rcu_dereference(dev->chanctx[i]);
+
+		if (curr_chanctx) {
+			curr_freq = curr_chanctx->def.chan->center_freq;
+
+			if (ieee80211_frequency_to_channel(curr_freq) == chan) {
+				chan_id = i;
+				break;
+			}
+		}
+	}
+
+	rcu_read_unlock();
+
+	if (i == MAX_CHANCTX) {
+		pr_err("%s: Invalid Channel Context\n", __func__);
+		return;
+	}
+
+
+	/* Switch to the new channel context */
+	/* SDK: Take care of locking requirements for these elements */
+	dev->curr_chanctx_idx = chan_id;
+
+	/* We now try to xmit any frames whose xmission got cancelled due to a
+	 * previous channel switch */
+	for (i = 0; i < NUM_TX_DESCS; i++) {
+		spin_lock_irqsave(&tx->lock, flags);
+
+		curr_bit = (i % TX_DESC_BUCKET_BOUND);
+		pool_id = (i / TX_DESC_BUCKET_BOUND);
+
+		if (test_and_set_bit(curr_bit, &tx->buf_pool_bmp[pool_id])) {
+			spin_unlock_irqrestore(&tx->lock, flags);
+			continue;
+		}
+
+
+		txq = &tx->pkt_info[dev->curr_chanctx_idx][i].pkt;
+		txq_len = skb_queue_len(txq);
+		queue = tx->pkt_info[dev->curr_chanctx_idx][i].queue;
+
+		if (!txq_len) {
+			/* Reserved token */
+			if (i < (NUM_TX_DESCS_PER_AC * NUM_ACS)) {
+				queue = (i % NUM_ACS);
+#ifdef UNIFORM_BW_SHARING
+				peer_id = get_curr_peer_opp(dev, queue);
+
+				if (peer_id == -1) {
+#else
+				pkts_pend =
+					skb_queue_len(&tx->pending_pkt[queue]);
+
+				if (!pkts_pend) {
+#endif
+					/* Mark the token as available */
+					__clear_bit(curr_bit,
+						    &tx->buf_pool_bmp[pool_id]);
+
+					spin_unlock_irqrestore(&tx->lock,
+							       flags);
+					continue;
+				}
+
+			/* Spare token */
+			} else {
+				for (ac = WLAN_AC_VO; ac >= 0; ac--) {
+#ifdef UNIFORM_BW_SHARING
+					peer_id = get_curr_peer_opp(dev, ac);
+
+					if (peer_id != -1) {
+#else
+					pkts_pend =
+					   skb_queue_len(&tx->pending_pkt[ac]);
+
+					if (pkts_pend) {
+#endif
+						queue = ac;
+						break;
+					}
+				}
+
+				if (ac < 0) {
+
+					/* Mark the token as available */
+					__clear_bit(curr_bit,
+						    &tx->buf_pool_bmp[pool_id]);
+
+					spin_unlock_irqrestore(&tx->lock,
+							       flags);
+					continue;
+				}
+			}
+
+			uccp420wlan_tx_proc_pend_frms(dev,
+						      queue,
+#ifdef UNIFORM_BW_SHARING
+						      peer_id,
+#endif
+						      i);
+
+			tx->outstanding_tokens[queue]++;
+
+		}
+
+		spin_unlock_irqrestore(&tx->lock, flags);
+
+		ret = __uccp420wlan_tx_frame(dev,
+					     queue,
+					     i,
+					     0); /* TODO: Currently sending 0
+						    since this param is not used
+						    as expected in the orig
+						    code for multiple frames etc
+						    Need to set this
+						    properly when the orig code
+						    logic is corrected */
+		if (ret < 0) {
+			/* SDK: Check if we need to clear the TX bitmap and
+			 * desc_chan_map here */
+			pr_err("%s: Queueing of TX frame to FW failed\n",
+			       __func__);
+		} else {
+			spin_lock_irqsave(&tx->lock, flags);
+			tx->desc_chan_map[i] = dev->curr_chanctx_idx;
+			spin_unlock_irqrestore(&tx->lock, flags);
+		}
+
+	}
+}
+#endif
 
 
 void uccp420wlan_rx_frame(struct sk_buff *skb, void *context)
@@ -1146,7 +1314,7 @@ void uccp420wlan_rx_frame(struct sk_buff *skb, void *context)
 		} else {
 #ifdef DRIVER_DEBUG
 			print_hex_dump(KERN_DEBUG, " ",
-				       DUMP_PREFIX_NONE, 16, 1, rx ,
+				       DUMP_PREFIX_NONE, 16, 1, rx,
 				       sizeof(struct wlan_rx_pkt), 1);
 #endif
 			dev_kfree_skb_any(skb);
@@ -1187,23 +1355,24 @@ void uccp420wlan_rx_frame(struct sk_buff *skb, void *context)
 			if (vif &&
 			ether_addr_equal(hdr->addr2, vif->bss_conf.bssid)) {
 				unsigned int ts2;
-				unsigned long long ts3;
+				unsigned int ldelta;
+
 				spin_lock(&tsf_lock);
 				dev->params->sync[i].status = 1;
 				memcpy(dev->params->sync[i].bssid,
 				       vif->bss_conf.bssid, 6);
 				memcpy(dev->params->sync[i].ts1,
-					(char *)hdr->addr4, 8);
-				memcpy(&ts3, &rx->reserved, 8);
+					&rx->reserved, 8);
 				memcpy(&ts2, &rx->reserved[8], 4);
 				memcpy(&dev->params->sync[i].ts2,
 						&rx->reserved[8], 4);
+				memcpy(&ldelta, &rx->reserved[12], 4);
 				dev->params->sync[i].atu = 0;
-				ts2 = get_real_ts2(ts2, get_unaligned_le64(
-					dev->params->sync[i].ts1), ts3);
+				/* ts2 = get_real_ts2(ts2, ldelta); */
 				if (frc_to_atu)
 					frc_to_atu(ts2,
 						&dev->params->sync[i].atu, 0);
+				dev->params->sync[i].atu -= ldelta * 1000;
 				spin_unlock(&tsf_lock);
 				break;
 			}
@@ -1220,6 +1389,7 @@ void uccp420wlan_ch_prog_complete(int event,
 				  void *context)
 {
 	struct mac80211_dev *dev = (struct mac80211_dev *)context;
+
 	dev->chan_prog_done = 1;
 }
 

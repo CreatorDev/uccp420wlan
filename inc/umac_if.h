@@ -193,6 +193,9 @@ extern int uccp420wlan_prog_channel(unsigned int prim_ch,
 				    unsigned int ch_no1,
 				    unsigned int ch_no2,
 				    unsigned int ch_width,
+#ifdef MULTI_CHAN_SUPPORT
+				    unsigned int vif_index,
+#endif
 				    unsigned int freq_band);
 
 extern int uccp420wlan_prog_peer_key(int index,
@@ -279,6 +282,10 @@ extern int uccp420wlan_lmac_if_init(void *context,
 extern void uccp420wlan_lmac_if_deinit(void);
 
 extern void uccp420_lmac_if_free_outstnding(void);
+
+#ifdef MULTI_CHAN_SUPPORT
+extern int uccp420wlan_prog_chanctx_time_info(void);
+#endif
 
 #endif /* _UCCP420WLAN_UMAC_IF_H_ */
 

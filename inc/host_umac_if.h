@@ -31,6 +31,18 @@
 #define TKIP_MIC_LEN 8
 #define MICHAEL_LEN 16
 #define MAX_KEY_LEN 16
+#define MAX_VIFS 2
+
+#ifdef UNIFORM_BW_SHARING
+#define MAX_PEERS 3
+/* Additional queue for unicast frames directed to non-associated peers (for
+ * e.g. Probe Responses etc) */
+#define MAX_PEND_Q_PER_AC (MAX_PEERS + MAX_VIFS)
+
+#ifdef MULTI_CHAN_SUPPORT
+#define MAX_CHANCTX 2
+#endif
+#endif
 
 #define WEP40_KEYLEN 5
 #define WEP104_KEYLEN 13
@@ -100,6 +112,9 @@ struct umac_event_tx_done {
 #define TX_DONE_STAT_KEY_NOT_FOUND (3)
 #define TX_DONE_STAT_DISCARD (4)
 #define TX_DONE_STAT_DISCARD_BCN (5)
+#ifdef MULTI_CHAN_SUPPORT
+#define TX_DONE_STAT_DISCARD_CHSW (6)
+#endif
 	unsigned char frm_status[MAX_TX_CMDS];
 	unsigned char retries_num[MAX_TX_CMDS];
 	/* rate = Units of 500 Kbps or mcs index = 0 to 7*/
@@ -112,6 +127,13 @@ struct umac_event_tx_done {
 struct umac_event_ch_prog_complete {
 	struct host_mac_msg_hdr hdr;
 } __packed;
+
+#ifdef MULTI_CHAN_SUPPORT
+struct umac_event_ch_switch {
+	struct host_mac_msg_hdr hdr;
+	int chan;
+} __packed;
+#endif
 
 struct umac_event_noa {
 	struct host_mac_msg_hdr hdr;
@@ -289,7 +311,13 @@ struct wlan_rx_pkt {
 	unsigned char ldpc_enabled;
 	unsigned char link_margin;
 	unsigned char channel;
-	unsigned char reserved[14];
+/* Currently size of reserved =
+ * sizeof(beacon_time_stamp = 8) +
+ * sizeof(ets_timer = 4) +
+ * sizeof(delta_timer_diff = 4) +
+ * (qos_padding = 2)
+ */
+	unsigned char reserved[18];
 	/*payload bytes */
 	unsigned char payload[0];
 } __packed;
@@ -350,7 +378,10 @@ enum UMAC_CMD_TAG {
 	UMAC_CMD_DISCARD_PKTS,
 	UMAC_CMD_MEASURE,
 	UMAC_CMD_BT_INFO,
-	UMAC_CMD_CLEAR_STATS
+	UMAC_CMD_CLEAR_STATS,
+#ifdef MULTI_CHAN_SUPPORT
+	UMAC_CMD_CHANCTX_TIME_INFO,
+#endif
 };
 
 enum UMAC_EVENT_TAG {
@@ -379,6 +410,9 @@ enum UMAC_EVENT_TAG {
 	UMAC_EVENT_RF_CALIB_DATA,
 	UMAC_EVENT_RADAR_DETECTED,
 	UMAC_EVENT_MSRMNT_COMPLETE,
+#ifdef MULTI_CHAN_SUPPORT
+	UMAC_EVENT_CHAN_SWITCH,
+#endif
 };
 
 enum CONNECT_RESULT_TAG {
@@ -735,6 +769,9 @@ struct cmd_channel {
 	 * 1 - 5ghz
 	 */
 	unsigned int freq_band;
+#ifdef MULTI_CHAN_SUPPORT
+	unsigned int vif_index;
+#endif
 } __packed;
 
 struct cmd_vif_cfg {
@@ -901,6 +938,18 @@ struct cmd_msrmnt_start {
 	unsigned short msr_dur;
 } __packed;
 
+
+#ifdef MULTI_CHAN_SUPPORT
+struct chanctx_time_info {
+	int chan;
+	int percentage;
+};
+
+struct cmd_chanctx_time_config {
+	struct host_mac_msg_hdr hdr;
+	struct chanctx_time_info info[MAX_CHANCTX];
+} __packed;
+#endif
 
 /* Events */
 
