@@ -1084,7 +1084,7 @@ static int cleanup_all_resources(void)
 	return 0;
 }
 
-static int uccp420_pltfr_probe(struct platform_device *pdev)
+static int uccp420_pltfr_probe (struct platform_device *pdev)
 {
 	struct resource *res;
 	int irq;
@@ -1171,9 +1171,6 @@ static int uccp420_pltfr_probe(struct platform_device *pdev)
 	if (pp && pp->value)
 		num_streams_vpd = *((int *)pp->value);
 
-	clk_set_rate(devm_clk_get(&pdev->dev, "wifi_pll"), 320000000);
-	clk_set_rate(devm_clk_get(&pdev->dev, "rpu_core_div"), 320000000);
-
 	clk_prepare_enable(devm_clk_get(&pdev->dev, "rpu_core"));
 	clk_prepare_enable(devm_clk_get(&pdev->dev, "rpu_l"));
 	clk_prepare_enable(devm_clk_get(&pdev->dev, "rpu_v"));
@@ -1195,6 +1192,22 @@ static int uccp420_pltfr_probe(struct platform_device *pdev)
 	return ret;
 }
 
+static int uccp420_pltfr_remove (struct platform_device *pdev)
+{
+	clk_disable_unprepare (devm_clk_get(&pdev->dev, "rpu_core"));
+	clk_disable_unprepare (devm_clk_get(&pdev->dev, "rpu_l"));
+	clk_disable_unprepare (devm_clk_get(&pdev->dev, "rpu_v"));
+	clk_disable_unprepare (devm_clk_get(&pdev->dev, "rpu_sleep"));
+	clk_disable_unprepare (devm_clk_get(&pdev->dev, "wifi_adc"));
+	clk_disable_unprepare (devm_clk_get(&pdev->dev, "wifi_dac"));
+
+	clk_disable_unprepare (devm_clk_get(&pdev->dev, "event_timer"));
+	clk_disable_unprepare (devm_clk_get(&pdev->dev, "sys_event_timer"));
+	clk_disable_unprepare (devm_clk_get(&pdev->dev, "aux_adc"));
+	clk_disable_unprepare (devm_clk_get(&pdev->dev, "aux_adc_internal"));
+
+	return 0;
+}
 
 static const struct of_device_id uccp420_dt_ids[] = {
 	{ .compatible = "img,pistachio-uccp"},
@@ -1204,6 +1217,7 @@ MODULE_DEVICE_TABLE(of, uccp420_dt_ids);
 
 struct platform_driver img_uccp_driver = {
 	.probe = uccp420_pltfr_probe,
+	.remove = uccp420_pltfr_remove,
 	.driver = {
 		.name     = "uccp420",
 		.owner    = THIS_MODULE,
