@@ -68,11 +68,6 @@ extern spinlock_t tsf_lock;
 #define DEBUG_LOG(...) do { } while (0)
 #endif
 
-#ifdef CONFIG_MULTI_CHAN_DEBUG
-#define MULTI_CHAN_DEBUG(fmt, args...) pr_debug(fmt, ##args)
-#else
-#define MULTI_CHAN_DEBUG(...) do { } while (0)
-#endif
 
 #define MAX_OUTSTANDING_CTRL_REQ 2
 #define RESET_TIMEOUT 5000   /* In milli-seconds*/
@@ -80,6 +75,9 @@ extern spinlock_t tsf_lock;
 /*100: For ROC, 500: For initial*/
 #define CH_PROG_TIMEOUT 500   /* In milli-seconds*/
 #define CH_PROG_TIMEOUT_TICKS msecs_to_jiffies(CH_PROG_TIMEOUT)
+
+#define QUEUE_FLUSH_TIMEOUT  2000   /* Specify delay in milli-seconds*/
+#define QUEUE_FLUSH_TIMEOUT_TICKS   msecs_to_jiffies(QUEUE_FLUSH_TIMEOUT)
 
 #ifdef CONFIG_PM
 #define PS_ECON_CFG_TIMEOUT 1000
@@ -112,6 +110,10 @@ extern spinlock_t tsf_lock;
 #define CLOCK_MASK 0x3FFFFFFF
 #define TICK_NUMRATOR 12288 /* 12288 KHz  */
 #define TICK_DENOMINATOR 1000 /* 1000 KHz */
+
+#define BTS_AP_24GHZ_ETS 195 /* Microsecs */
+#define BTS_AP_5GHZ_ETS 25 /* Microsecs */
+
 
 enum noa_triggers {
 	FROM_TX = 0,
@@ -386,6 +388,11 @@ struct tx_pkt_info {
 	struct sk_buff_head pkt;
 	unsigned int hdr_len;
 	unsigned int queue;
+	unsigned int rate[4];
+	unsigned int retries[4];
+	unsigned int curr_retries;
+	unsigned int max_retries;
+	bool adjusted_rates;
 };
 
 
@@ -403,7 +410,6 @@ struct tx_config {
 	unsigned int next_spare_token_ac;
 
 	/* Used to store the address of pending skbs per ac */
-#ifdef UNIFORM_BW_SHARING
 	struct sk_buff_head pending_pkt[MAX_PEND_Q_PER_AC][NUM_ACS];
 
 #ifdef MULTI_CHAN_SUPPORT
@@ -411,9 +417,6 @@ struct tx_config {
 	unsigned int curr_peer_opp[MAX_CHANCTX][NUM_ACS];
 #else
 	unsigned int curr_peer_opp[NUM_ACS];
-#endif
-#else
-	struct sk_buff_head pending_pkt[NUM_ACS];
 #endif
 
 	/* Used to store the address of tx'ed skb and len of 802.11 hdr
@@ -459,11 +462,11 @@ struct econ_ps_cfg_status {
 #endif
 
 struct current_channel {
-	unsigned int pri_chnl_num;
-	unsigned int chnl_num1;
-	unsigned int chnl_num2;
+	unsigned int center_freq1;
+	unsigned int center_freq2;
 	unsigned int freq_band;
 	unsigned int ch_width;
+	unsigned int pri_chnl_num;
 };
 
 struct roc_params {
@@ -507,9 +510,7 @@ struct mac80211_dev {
 			 * STA mode is active
 			 */
 	struct ieee80211_vif *vifs[MAX_VIFS];
-#ifdef UNIFORM_BW_SHARING
 	struct ieee80211_sta *peers[MAX_PEERS];
-#endif
 	struct ieee80211_hw *hw;
 	struct sta_tid_info  tid_info[32];
 	spinlock_t bcast_lock; /* Used to ensure more_frames bit is set properly
@@ -566,14 +567,13 @@ struct umac_vif {
 #endif
 };
 
-#ifdef UNIFORM_BW_SHARING
 struct umac_sta {
 	int index;
+	int vif_index;
 #ifdef MULTI_CHAN_SUPPORT
 	struct umac_chanctx *chanctx;
 #endif
 };
-#endif
 
 #ifdef MULTI_CHAN_SUPPORT
 struct umac_chanctx {
@@ -605,12 +605,21 @@ extern void uccp420wlan_vif_set_edca_params(unsigned short queue,
 extern void uccp420wlan_vif_bss_info_changed(struct umac_vif *uvif,
 					     struct ieee80211_bss_conf
 					     *bss_conf, unsigned int changed);
-extern int  uccp420wlan_tx_frame(struct sk_buff *skb, struct ieee80211_sta *sta,
-				 struct mac80211_dev *dev, bool bcast);
+extern int  uccp420wlan_tx_frame(struct sk_buff *skb,
+				 struct ieee80211_sta *sta,
+				 struct mac80211_dev *dev,
+#ifdef MULTI_CHAN_SUPPORT
+				 int curr_chanctx_idx,
+#endif
+				 bool bcast);
 extern int __uccp420wlan_tx_frame(struct mac80211_dev *dev,
 				  unsigned int queue,
 				  unsigned int token_id,
-				  unsigned int more_frames);
+#ifdef MULTI_CHAN_SUPPORT
+				  int curr_chanctx_idx,
+#endif
+				  unsigned int more_frames,
+				  bool retry);
 extern void uccp420wlan_tx_init(struct mac80211_dev *dev);
 extern void uccp420wlan_tx_deinit(struct mac80211_dev *dev);
 
@@ -620,14 +629,16 @@ extern int wait_for_reset_complete(struct mac80211_dev *dev);
 
 extern void uccp420wlan_tx_proc_pend_frms(struct mac80211_dev *dev,
 				   int queue,
-#ifdef UNIFORM_BW_SHARING
+#ifdef MULTI_CHAN_SUPPORT
+				   int curr_chanctx_idx,
+#endif
 				   int peer_id,
-#endif
 				   int token_id);
-#ifdef UNIFORM_BW_SHARING
 int get_curr_peer_opp(struct mac80211_dev *dev,
-		      int queue);
+#ifdef MULTI_CHAN_SUPPORT
+		      int curr_chanctx_idx,
 #endif
+		      int queue);
 
 /* Beacon TimeStamp */
 __s32 __attribute__((weak)) frc_to_atu(__u32 frccnt, __u64 *patu, s32 dir);

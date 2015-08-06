@@ -83,7 +83,11 @@ extern int uccp420wlan_proc_tx(void);
 
 extern int uccp420wlan_prog_tx(unsigned int queue,
 			       unsigned int more_data,
-			       unsigned int tokenid);
+#ifdef MULTI_CHAN_SUPPORT
+			       int curr_chanctx_idx,
+#endif
+			       unsigned int tokenid,
+			       bool retry);
 
 extern int uccp420wlan_sta_add(int index,
 			       struct peer_sta_info *sta);
@@ -190,8 +194,8 @@ extern int uccp420wlan_prog_txq_params(int index,
 				       unsigned int uapsd);
 
 extern int uccp420wlan_prog_channel(unsigned int prim_ch,
-				    unsigned int ch_no1,
-				    unsigned int ch_no2,
+				    unsigned int center_freq1,
+				    unsigned int center_freq2,
 				    unsigned int ch_width,
 #ifdef MULTI_CHAN_SUPPORT
 				    unsigned int vif_index,
@@ -254,6 +258,9 @@ extern void uccp420wlan_proc_tx_complete(struct umac_event_tx_done *txdone,
 				    void *context);
 
 extern void uccp420wlan_tx_complete(struct umac_event_tx_done *txdone,
+#ifdef MULTI_CHAN_SUPPORT
+				    int curr_chanctx_idx,
+#endif
 				    void *context);
 
 extern void uccp420wlan_rx_frame(struct sk_buff *skb,

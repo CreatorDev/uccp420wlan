@@ -1624,7 +1624,8 @@ int hal_map_tx_buf(int pkt_desc, int frame_id, unsigned char *data, int len)
 	dma_addr_t dma_buf = 0;
 
 	/* For QoS Null frames we dont try to map the frame since the data len
-	 * will be 0 and there is nothing for the FW to process */
+	 * will be 0 and there is nothing for the FW to process
+	 */
 	if (len == 0)
 		return 0;
 
@@ -1689,7 +1690,8 @@ int hal_unmap_tx_buf(int pkt_desc, int frame_id)
 
 	/* For QoS Null frames we did not map the frame (since the data len
 	 * will be 0 and there is nothing for the FW to process), hence no need
-	 * to try and unmap */
+	 * to try and unmap
+	 */
 	if (!hpriv->tx_buf_info[index].dma_buf_len)
 		return 0;
 

@@ -139,6 +139,8 @@ static void update_mcs_packet_stat(int mcs_rate_num,
 
 static void get_rate(struct sk_buff *skb,
 		     struct cmd_tx_ctrl *txcmd,
+		     struct tx_pkt_info *pkt_info,
+		     bool retry,
 		     struct mac80211_dev *dev)
 {
 	struct ieee80211_rate *rate;
@@ -461,7 +463,28 @@ static void get_rate(struct sk_buff *skb,
 			!(txcmd->rate_flags[index] &
 			  ENABLE_CHNL_WIDTH_80MHZ))
 				/* Downgrade to VHT-MCS8-Nss-1 */
-				txcmd->rate[index] = 0x88;
+			txcmd->rate[index] = 0x88;
+
+		/*First Time*/
+#ifdef notyet
+		if (!retry) {
+#endif
+			if (!index)
+				pkt_info->max_retries = 0;
+			pkt_info->max_retries +=
+				txcmd->rate_retries[index];
+#ifdef notyet
+			pkt_info->retries[index] =
+				txcmd->rate_retries[index];
+			DEBUG_LOG("%s-UMACTX : Using MINSTREL rates\n",
+				  dev->name);
+		} else {
+			txcmd->rate_retries[index] =
+				pkt_info->retries[index];
+			DEBUG_LOG("%s-UMACTX : Using Adjusted rates\n",
+				  dev->name);
+		}
+#endif
 
 		txcmd->num_rates++;
 	}
@@ -814,7 +837,7 @@ int uccp420wlan_prog_vht_bform(unsigned int vht_beamform_status,
 }
 
 
-int uccp420wlan_prog_roc(unsigned int roc_status,
+int uccp420wlan_prog_roc(unsigned int roc_ctrl,
 			 unsigned int roc_channel,
 			 unsigned int roc_duration)
 {
@@ -822,7 +845,7 @@ int uccp420wlan_prog_roc(unsigned int roc_status,
 
 	memset(&cmd_roc, 0, sizeof(struct cmd_roc));
 
-	cmd_roc.roc_status	= roc_status;
+	cmd_roc.roc_ctrl	= roc_ctrl;
 	cmd_roc.roc_channel	= roc_channel;
 	cmd_roc.roc_duration	= roc_duration;
 
@@ -1170,8 +1193,8 @@ int uccp420wlan_scan_abort(int index)
 
 
 int uccp420wlan_prog_channel(unsigned int prim_ch,
-			     unsigned int ch_no1,
-			     unsigned int ch_no2,
+			     unsigned int center_freq1,
+			     unsigned int center_freq2,
 			     unsigned int ch_width,
 #ifdef MULTI_CHAN_SUPPORT
 			     unsigned int vif_index,
@@ -1179,8 +1202,72 @@ int uccp420wlan_prog_channel(unsigned int prim_ch,
 			     unsigned int freq_band)
 {
 	struct cmd_channel channel;
+	struct lmac_if_data *p;
+	struct mac80211_dev *dev;
+	int is_vht_bw80_sec_40minus;
+	int is_vht_bw80_sec_40plus;
+	int is_vht_bw80;
+	int ch_no1, ch_no2;
+	unsigned int cf_offset = center_freq1;
 
 	memset(&channel, 0, sizeof(struct cmd_channel));
+
+	rcu_read_lock();
+	p = (struct lmac_if_data *)(rcu_dereference(lmac_if));
+
+	if (!p) {
+		WARN_ON(1);
+		rcu_read_unlock();
+		return -1;
+		}
+	dev = p->context;
+	if (dev->params->production_test == 1) {
+			if ((dev->params->prod_mode_chnl_bw_40_mhz == 1) &&
+				(dev->params->sec_ch_offset_40_minus == 1)) {
+				/*  NL80211_CHAN_HT40MINUS */
+				ch_width = 2;
+				cf_offset -= 10;
+			} else if (dev->params->prod_mode_chnl_bw_40_mhz == 1) {
+				/* NL80211_CHAN_HT40PLUS */
+				ch_width = 2;
+				cf_offset += 10;
+			}
+
+			is_vht_bw80 = vht_support &&
+				(dev->params->prod_mode_chnl_bw_80_mhz == 1);
+
+			is_vht_bw80_sec_40minus = is_vht_bw80 &&
+				(dev->params->sec_ch_offset_40_minus == 1);
+
+			is_vht_bw80_sec_40plus = is_vht_bw80 &&
+				(dev->params->sec_ch_offset_40_plus == 1);
+
+			if (is_vht_bw80)
+				ch_width = 3;
+
+			if (is_vht_bw80_sec_40minus &&
+			    (dev->params->sec_40_ch_offset_80_minus == 1))
+				cf_offset -= 30;
+			else if (is_vht_bw80_sec_40minus &&
+				 (dev->params->sec_40_ch_offset_80_plus == 1))
+				cf_offset += 10;
+			else if (is_vht_bw80_sec_40minus)/* default */
+				cf_offset -= 30;
+
+			if (is_vht_bw80_sec_40plus &&
+			    (dev->params->sec_40_ch_offset_80_minus == 1))
+				cf_offset -= 10;
+			else if (is_vht_bw80_sec_40plus &&
+				 (dev->params->sec_40_ch_offset_80_plus == 1))
+				cf_offset += 30;
+			else if (is_vht_bw80_sec_40plus)/* default */
+				cf_offset -= 10;
+
+
+	}
+	ch_no1 = ieee80211_frequency_to_channel(cf_offset);
+	ch_no2 = 0;
+
 	channel.primary_ch_number = prim_ch;
 	channel.channel_number1 = ch_no1;
 	channel.channel_number2 = ch_no2;
@@ -1208,6 +1295,12 @@ int uccp420wlan_prog_channel(unsigned int prim_ch,
 #ifdef MULTI_CHAN_SUPPORT
 	channel.vif_index = vif_index;
 #endif
+	dev->cur_chan.center_freq1 = cf_offset;
+	dev->cur_chan.center_freq2 = ch_no2;
+	dev->cur_chan.pri_chnl_num = prim_ch;
+	dev->cur_chan.ch_width  = ch_width;
+	dev->cur_chan.freq_band = freq_band;
+	dev->chan_prog_done = 0;
 
 	return uccp420wlan_send_cmd((unsigned char *) &channel,
 				    sizeof(struct cmd_channel),
@@ -1289,7 +1382,11 @@ int uccp420wlan_prog_ps_state(int index,
 
 int uccp420wlan_prog_tx(unsigned int queue,
 			unsigned int more_frms,
-			unsigned int descriptor_id)
+#ifdef MULTI_CHAN_SUPPORT
+			int curr_chanctx_idx,
+#endif
+			unsigned int descriptor_id,
+			bool retry)
 {
 	struct cmd_tx_ctrl tx_cmd;
 	struct sk_buff *nbuf, *nbuf_start;
@@ -1306,7 +1403,7 @@ int uccp420wlan_prog_tx(unsigned int queue,
 	__u16 fc;
 	unsigned long irq_flags, tx_irq_flags;
 #ifdef MULTI_CHAN_SUPPORT
-	int chan_id = 0;
+	struct tx_pkt_info *pkt_info = NULL;
 #endif
 
 	memset(&tx_cmd, 0, sizeof(struct cmd_tx_ctrl));
@@ -1323,9 +1420,11 @@ int uccp420wlan_prog_tx(unsigned int queue,
 	dev = p->context;
 	spin_lock_irqsave(&dev->tx.lock, tx_irq_flags);
 #ifdef MULTI_CHAN_SUPPORT
-	txq = &dev->tx.pkt_info[dev->curr_chanctx_idx][descriptor_id].pkt;
+	txq = &dev->tx.pkt_info[curr_chanctx_idx][descriptor_id].pkt;
+	pkt_info = &dev->tx.pkt_info[curr_chanctx_idx][descriptor_id];
 #else
 	txq = &dev->tx.pkt_info[descriptor_id].pkt;
+	pkt_info = &dev->tx.pkt_info[descriptor_id];
 #endif
 	skb_first = skb_peek(txq);
 
@@ -1406,8 +1505,12 @@ int uccp420wlan_prog_tx(unsigned int queue,
 		return -20;
 	}
 
-	 /* Get the rate for first packet as all packets have same rate */
-	get_rate(skb_first, &tx_cmd, dev);
+	/* Get the rate for first packet as all packets have same rate */
+	get_rate(skb_first,
+		 &tx_cmd,
+		 pkt_info,
+		 retry,
+		 dev);
 
 	data = skb_put(nbuf, sizeof(struct cmd_tx_ctrl));
 	memset(data, 0, sizeof(struct cmd_tx_ctrl));
@@ -1430,6 +1533,14 @@ int uccp420wlan_prog_tx(unsigned int queue,
 		     tx_cmd.rate[2],
 		     tx_cmd.rate[3]);
 
+	DEBUG_LOG("%s-UMACTX: Retries   = %d, %d, %d, %d, %d\n",
+		  dev->name,
+		  pkt_info->max_retries,
+		  tx_cmd.rate_retries[0],
+		  tx_cmd.rate_retries[1],
+		  tx_cmd.rate_retries[2],
+		  tx_cmd.rate_retries[3]);
+
 	skb_queue_walk_safe(txq, skb, tmp) {
 		if (!skb || (pkt > tx_cmd.num_frames_per_desc))
 			break;
@@ -1439,7 +1550,8 @@ int uccp420wlan_prog_tx(unsigned int queue,
 		/* Only for Non-Qos and MGMT frames, for Qos-Data
 		 * mac80211 handles the sequence no generation
 		 */
-		if (tx_info_first->flags &
+		if (!retry &&
+		    tx_info_first->flags &
 		    IEEE80211_TX_CTL_ASSIGN_SEQ) {
 			if (tx_info_first->flags &
 			    IEEE80211_TX_CTL_FIRST_FRAGMENT) {
@@ -1452,9 +1564,9 @@ int uccp420wlan_prog_tx(unsigned int queue,
 
 		/* Need it for tx_status later */
 #ifdef MULTI_CHAN_SUPPORT
-		dev->tx.pkt_info[dev->curr_chanctx_idx][descriptor_id].hdr_len =
+		dev->tx.pkt_info[curr_chanctx_idx][descriptor_id].hdr_len =
 			hdrlen;
-		dev->tx.pkt_info[dev->curr_chanctx_idx][descriptor_id].queue =
+		dev->tx.pkt_info[curr_chanctx_idx][descriptor_id].queue =
 			queue;
 #else
 		dev->tx.pkt_info[descriptor_id].hdr_len = hdrlen;
@@ -1492,10 +1604,10 @@ int uccp420wlan_prog_tx(unsigned int queue,
 #endif
 
 		/* SDK: Check if we can use the same txq initialized before in
-		 * the function here */
+		 * the function here
+		 */
 #ifdef MULTI_CHAN_SUPPORT
-		chan_id = dev->curr_chanctx_idx;
-		txq = &dev->tx.pkt_info[chan_id][descriptor_id].pkt;
+		txq = &dev->tx.pkt_info[curr_chanctx_idx][descriptor_id].pkt;
 #else
 		txq = &dev->tx.pkt_info[descriptor_id].pkt;
 #endif
@@ -1974,8 +2086,8 @@ int uccp420wlan_prog_econ_ps_state(int if_index,
 #endif
 
 
-int uccp420wlan_msg_handler (void *nbuff,
-			     unsigned char sender_id)
+int uccp420wlan_msg_handler(void *nbuff,
+			    unsigned char sender_id)
 {
 	unsigned int event;
 	unsigned char *buff;
@@ -1985,6 +2097,9 @@ int uccp420wlan_msg_handler (void *nbuff,
 	struct sk_buff *pending_cmd;
 	unsigned long irq_flags;
 	struct mac80211_dev *dev;
+#ifdef MULTI_CHAN_SUPPORT
+	int curr_chanctx_idx = -1;
+#endif
 
 	rcu_read_lock();
 
@@ -2070,7 +2185,15 @@ int uccp420wlan_msg_handler (void *nbuff,
 			 */
 			dev->stats->tx_done_recv_count++;
 
+#ifdef MULTI_CHAN_SUPPORT
+			spin_lock(&dev->chanctx_lock);
+			curr_chanctx_idx = dev->curr_chanctx_idx;
+			spin_unlock(&dev->chanctx_lock);
+#endif
 			uccp420wlan_tx_complete((void *)buff,
+#ifdef MULTI_CHAN_SUPPORT
+						curr_chanctx_idx,
+#endif
 						p->context);
 		}
 
@@ -2162,7 +2285,8 @@ int uccp420wlan_msg_handler (void *nbuff,
 		uccp420wlan_rf_calib_data(rf_data, p->context);
 #ifdef MULTI_CHAN_SUPPORT
 	/* SDK: Need to see if this will work in tasklet context (due to
-	 * scheduling latencies) */
+	 * scheduling latencies)
+	 */
 	} else if (event == UMAC_EVENT_CHAN_SWITCH) {
 		uccp420wlan_proc_ch_sw_event((void *)buff,
 					     p->context);
