@@ -178,7 +178,7 @@ static struct ieee80211_supported_band band_5ghz = {
 };
 
 
-/* Interface combinations for Virtual interfaces*/
+/* Interface combinations for Virtual interfaces */
 static const struct ieee80211_iface_limit if_limit1[] = {
 		{ .max = 2, .types = BIT(NL80211_IFTYPE_STATION)}
 };
@@ -203,7 +203,8 @@ static const struct ieee80211_iface_limit if_limit4[] = {
 #ifdef MULTI_CHAN_SUPPORT
 static const struct ieee80211_iface_limit if_limit5[] = {
 		{ .max = 1, .types = BIT(NL80211_IFTYPE_STATION)},
-		{ .max = 1, .types = BIT(NL80211_IFTYPE_AP)}
+		{ .max = 1, .types = BIT(NL80211_IFTYPE_AP) |
+				     BIT(NL80211_IFTYPE_P2P_GO)}
 };
 #endif
 
@@ -271,6 +272,111 @@ static int conv_str_to_byte(unsigned char *byte,
 	}
 
 	return 0;
+}
+
+
+static void uccp420_roc_complete_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = NULL;
+	struct mac80211_dev *dev = NULL;
+	unsigned long flags;
+	struct umac_chanctx *off_chanctx = NULL;
+	struct umac_vif *uvif = NULL, *tmp = NULL;
+	struct tx_config *tx = NULL;
+	u32 roc_queue = 0;
+	bool need_offchan;
+	int roc_off_chanctx_idx = -1;
+	int chan_id = 0;
+
+	dwork = container_of(work, struct delayed_work, work);
+	dev = container_of(dwork, struct mac80211_dev, roc_complete_work);
+	tx = &dev->tx;
+
+	mutex_lock(&dev->mutex);
+	need_offchan = dev->roc_params.need_offchan;
+
+	roc_queue = tx_queue_unmap(UMAC_ROC_AC);
+	roc_off_chanctx_idx = dev->roc_off_chanctx_idx;
+
+	/* Stop the ROC queue */
+	ieee80211_stop_queue(dev->hw, roc_queue);
+	/* Unlock RCU immediately as we are freeing off_chanctx in this funciton
+	 * only and because flush_vif_queues sleep
+	 */
+	rcu_read_lock();
+	off_chanctx = rcu_dereference(dev->off_chanctx[roc_off_chanctx_idx]);
+	rcu_read_unlock();
+
+	list_for_each_entry_safe(uvif, tmp, &off_chanctx->vifs, list) {
+		if (uvif == NULL || uvif->off_chanctx  == NULL)
+			continue;
+		/* Flush the TX queues */
+		uccp420_flush_vif_queues(dev,
+					 uvif,
+					 uvif->off_chanctx->index,
+					 BIT(UMAC_ROC_AC),
+					 UMAC_VIF_CHANCTX_TYPE_OFF);
+
+
+		spin_lock_irqsave(&tx->lock, flags);
+		spin_lock(&dev->chanctx_lock);
+
+		/* ROC DONE: Move the channel context */
+		if (uvif->chanctx)
+			dev->curr_chanctx_idx = uvif->chanctx->index;
+		else
+			dev->curr_chanctx_idx = -1;
+
+		spin_unlock(&dev->chanctx_lock);
+		spin_unlock_irqrestore(&tx->lock, flags);
+
+		if (need_offchan) {
+			/* DEL from OFF chan list */
+			list_del_init(&uvif->list);
+			if (uvif->chanctx) {
+				/* Add it back to OP chan list */
+				list_add_tail(&uvif->list,
+					      &uvif->chanctx->vifs);
+
+				/* !need_offchan: In this case, the frames are
+				 * transmitted, so trigger is not needed.
+				 *
+				 * need_offchan: In this case, frames are
+				 * buffered so we need trigger in case no frames
+				 * come from mac80211.
+				 */
+				/* Process OPER pending frames only.
+				 * TXQ is flushed before start of ROC
+				 */
+				chan_id = uvif->chanctx->index;
+				uccp420wlan_tx_proc_send_pend_frms_all(dev,
+								       chan_id);
+			}
+			off_chanctx->nvifs--;
+		}
+		uvif->off_chanctx = NULL;
+	}
+
+	if (need_offchan)
+		kfree(off_chanctx);
+
+
+	rcu_assign_pointer(dev->off_chanctx[roc_off_chanctx_idx], NULL);
+	dev->roc_off_chanctx_idx = -1;
+	dev->roc_params.roc_in_progress = 0;
+
+	if (dev->cancel_roc == 0) {
+		ieee80211_remain_on_channel_expired(dev->hw);
+		DEBUG_LOG("%s-80211IF: ROC STOPPED..\n", dev->name);
+	} else {
+		dev->cancel_hw_roc_done = 1;
+		dev->cancel_roc = 0;
+		DEBUG_LOG("%s-80211IF: ROC CANCELLED..\n", dev->name);
+	}
+
+	/* Start the ROC queue */
+	ieee80211_wake_queue(dev->hw, roc_queue);
+	mutex_unlock(&dev->mutex);
 }
 
 
@@ -377,10 +483,13 @@ static int start(struct ieee80211_hw *hw)
 		mutex_unlock(&dev->mutex);
 		return -ENODEV;
 	}
+
 	INIT_DELAYED_WORK(&dev->roc_complete_work, uccp420_roc_complete_work);
+
 	dev->state = STARTED;
 	memset(dev->params->pdout_voltage, 0,
 	       sizeof(char) * MAX_AUX_ADC_SAMPLES);
+	dev->roc_off_chanctx_idx = -1;
 	mutex_unlock(&dev->mutex);
 
 	return 0;
@@ -408,19 +517,28 @@ static int add_interface(struct ieee80211_hw *hw,
 	struct umac_vif   *uvif;
 	int vif_index, iftype;
 
+	mutex_lock(&dev->mutex);
 	iftype = vif->type;
 	v = vif;
 	vif->driver_flags |= IEEE80211_VIF_BEACON_FILTER;
 	vif->driver_flags |= IEEE80211_VIF_SUPPORTS_UAPSD;
 
-	if (!(iftype == NL80211_IFTYPE_STATION ||
-				iftype == NL80211_IFTYPE_ADHOC ||
-				iftype == NL80211_IFTYPE_AP)) {
-		pr_err("Invalid Interface type\n");
+	if (dev->current_vif_count == wifi->params.num_vifs) {
+		pr_err("%s: Exceeded Maximum supported VIF's cur:%d max: %d.\n",
+		       __func__,
+		       dev->current_vif_count,
+		       wifi->params.num_vifs);
+
+		mutex_unlock(&dev->mutex);
 		return -ENOTSUPP;
 	}
 
-	mutex_lock(&dev->mutex);
+	if (!(iftype == NL80211_IFTYPE_STATION ||
+	      iftype == NL80211_IFTYPE_ADHOC ||
+	      iftype == NL80211_IFTYPE_AP)) {
+		pr_err("Invalid Interface type\n");
+		return -ENOTSUPP;
+	}
 
 	if (wifi->params.production_test) {
 		if (dev->active_vifs || iftype != NL80211_IFTYPE_ADHOC) {
@@ -448,6 +566,7 @@ static int add_interface(struct ieee80211_hw *hw,
 	uvif->seq_no = 0;
 	uccp420wlan_vif_add(uvif);
 	dev->active_vifs |= (1 << vif_index);
+	dev->current_vif_count++;
 
 	if (iftype == NL80211_IFTYPE_ADHOC)
 		dev->tx_last_beacon = 0;
@@ -467,16 +586,16 @@ static void remove_interface(struct ieee80211_hw *hw,
 	struct ieee80211_vif *v;
 	int vif_index;
 
+	mutex_lock(&dev->mutex);
 	v = vif;
 	vif_index = ((struct umac_vif *)&v->drv_priv)->vif_index;
-
-	mutex_lock(&dev->mutex);
 
 	uccp420wlan_vif_remove((struct umac_vif *)&v->drv_priv);
 	dev->active_vifs &= ~(1 << vif_index);
 	rcu_assign_pointer(dev->vifs[vif_index], NULL);
 	synchronize_rcu();
 
+	dev->current_vif_count--;
 	mutex_unlock(&dev->mutex);
 
 }
@@ -587,9 +706,9 @@ static int config(struct ieee80211_hw *hw,
 	if (changed & IEEE80211_CONF_CHANGE_RETRY_LIMITS) {
 
 		DEBUG_LOG("%s-80211IF:Retry Limits changed to %d and %d\n",
-			       dev->name,
-			       conf->short_frame_max_tx_count,
-			       conf->long_frame_max_tx_count);
+			  dev->name,
+			  conf->short_frame_max_tx_count,
+			  conf->long_frame_max_tx_count);
 	}
 
 	for (i = 0; i < MAX_VIFS; i++) {
@@ -1136,6 +1255,7 @@ static void init_hw(struct ieee80211_hw *hw)
 	hw->wiphy->max_scan_ie_len = IEEE80211_MAX_DATA_LEN;
 	hw->max_listen_interval = 10;
 	hw->wiphy->max_remain_on_channel_duration = 5000; /*ROC*/
+	hw->offchannel_tx_hw_queue = WLAN_AC_VO;
 	hw->max_rates = 4;
 	hw->max_rate_tries = 5;
 	hw->queues = 4;
@@ -1271,193 +1391,160 @@ static int set_antenna(struct ieee80211_hw *hw, u32 tx_ant, u32 rx_ant)
 }
 
 
-static void uccp420_roc_complete_work(struct work_struct *work)
-{
-	struct delayed_work *dwork;
-	int i;
-	struct mac80211_dev *dev;
-
-	dwork = container_of(work, struct delayed_work, work);
-	dev = container_of(dwork, struct mac80211_dev, roc_complete_work);
-
-	if (atomic_read(&dev->roc_params.roc_mgmt_tx_count) != 0) {
-		DEBUG_LOG("%s:%d but %d off channel tx frames pending\n",
-			  __func__,
-			  __LINE__,
-			  atomic_read(&dev->roc_params.roc_mgmt_tx_count));
-		return;
-	}
-
-	/* ROC Completed */
-	mutex_lock(&dev->mutex);
-
-	/* Put the chip back to its original state */
-	for (i = 0; i < MAX_VIFS; i++) {
-
-		if (!dev->roc_params.roc_ps_changed)
-			break;
-
-		if (!(dev->active_vifs & (1 << i)))
-			continue;
-
-		uccp420wlan_prog_ps_state(i,
-					  dev->if_mac_addresses[i].addr,
-					  dev->power_save);
-	}
-
-	dev->roc_params.roc_ps_changed = 0;
-
-	if (dev->roc_params.roc_chan_changed) {
-		dev->chan_prog_done = 0;
-
-		uccp420wlan_prog_channel(dev->cur_chan.pri_chnl_num,
-					 dev->cur_chan.center_freq1,
-					 dev->cur_chan.center_freq2,
-					 dev->cur_chan.ch_width,
-#ifdef MULTI_CHAN_SUPPORT
-					 0,
-#endif
-					 dev->cur_chan.freq_band);
-
-		if (wait_for_channel_prog_complete(dev)) {
-			pr_err("%s:%d ROC Complete: Programming the Channel %d Timed-out (500ms)\n",
-			       __func__, __LINE__, dev->cur_chan.pri_chnl_num);
-			dev->roc_params.roc_in_progress = 0;
-			dev->roc_params.roc_chan_changed = 0;
-			ieee80211_remain_on_channel_expired(dev->hw);
-			mutex_unlock(&dev->mutex);
-
-			/* Unable to go back to Home channel, what next?? */
-			return;
-		}
-
-		dev->roc_params.roc_chan_changed = 0;
-	}
-
-	/* Inform FW that ROC is started */
-	uccp420wlan_prog_roc(ROC_START, dev->cur_chan.pri_chnl_num, 0);
-
-	ieee80211_remain_on_channel_expired(dev->hw);
-	dev->roc_params.roc_in_progress = 0;
-
-	DEBUG_LOG("%s:%d Coming back to Orig: %d\n",
-		  __func__,
-		  __LINE__,
-		  dev->power_save);
-
-	mutex_unlock(&dev->mutex);
-}
-
-
 static int remain_on_channel(struct ieee80211_hw *hw,
 			     struct ieee80211_vif *vif,
 			     struct ieee80211_channel *channel,
 			     int duration,
 			     enum ieee80211_roc_type type)
-
 {
-	int i;
 	struct mac80211_dev *dev = (struct mac80211_dev *)hw->priv;
-	unsigned int pri_chnl_num = 0;
-	unsigned int chnl_num1 = 0;
-	unsigned int freq_band = channel->band;
-	unsigned int ch_width = 0; /* 20MHz */
-#ifdef MULTI_CHAN_SUPPORT
+	unsigned int pri_chnl_num =
+		ieee80211_frequency_to_channel(channel->center_freq);
 	struct umac_vif *uvif = (struct umac_vif *)vif->drv_priv;
-#endif
-
-	pri_chnl_num = ieee80211_frequency_to_channel(channel->center_freq);
-	chnl_num1 = ieee80211_frequency_to_channel(channel->center_freq);
+	struct umac_chanctx *off_chanctx = NULL;
+	int off_chanctx_id = 0, i = 0;
+	unsigned long flags;
+	struct tx_config *tx = &dev->tx;
+	u32 hw_queue_map = 0;
+	struct ieee80211_chanctx_conf *vif_chanctx;
+	bool need_offchan = true;
 
 	mutex_lock(&dev->mutex);
 
-	DEBUG_LOG("%s:%d orig_ps: %d The Params are: channel:%d\n",
-		  __func__, __LINE__,
-		  dev->power_save,
-		  pri_chnl_num);
-	DEBUG_LOG("	duration:%d type: %d c1:%d band:%d\n",
+	DEBUG_LOG("%s-80211IF: Params are Chan:%d Dur:%d Type: %d\n",
+		  dev->name,
+		  ieee80211_frequency_to_channel(channel->center_freq),
 		  duration,
-		  type,
-		  chnl_num1,
-		  freq_band);
+		  type);
 
-	/* Put the chip in powersave */
-	for (i = 0; i < MAX_VIFS; i++) {
-		if (dev->power_save == PWRSAVE_STATE_AWAKE)
-			break;
-
-		dev->roc_params.roc_ps_changed = 1;
-
-		if (!(dev->active_vifs & (1 << i)))
-			continue;
-
-		uccp420wlan_prog_ps_state(i,
-					  dev->if_mac_addresses[i].addr,
-					  PWRSAVE_STATE_AWAKE);
+	if (dev->roc_params.roc_in_progress) {
+		DEBUG_LOG("%s-80211IF: Dropping roc...Busy\n", dev->name);
+		mutex_unlock(&dev->mutex);
+		return -EBUSY;
 	}
 
-	do {
-		if (dev->cur_chan.pri_chnl_num == pri_chnl_num)
-			break;
+	if (dev->num_active_chanctx == 2) {
+		DEBUG_LOG("%s-80211IF: ROC is not supported in TSMC Mode\n",
+			  dev->name);
 
-		DEBUG_LOG("%s:%d Programming the Channel\n",
-			  __func__, __LINE__);
-
-		dev->chan_prog_done = 0;
-
-		uccp420wlan_prog_channel(dev->cur_chan.pri_chnl_num,
-					channel->center_freq,
-					 0,
-					 ch_width,
-#ifdef MULTI_CHAN_SUPPORT
-					 uvif->vif_index,
-#endif
-					 freq_band);
-
-		if (!wait_for_channel_prog_complete(dev)) {
-			dev->roc_params.roc_chan_changed = 1;
-			break;
-		}
-
-		pr_err("%s:%d ROC Start: Programming the Channel %d Timed-out (500ms)\n",
-			__func__, __LINE__, pri_chnl_num);
-
-		/* Put the chip back to its orig state*/
-		for (i = 0; i < MAX_VIFS; i++) {
-			if (!dev->roc_params.roc_ps_changed)
-				break;
-
-			if (!(dev->active_vifs & (1 << i)))
-				continue;
-
-			uccp420wlan_prog_ps_state(i,
-						  dev->if_mac_addresses[i].addr,
-						  dev->power_save);
-		}
-
-		dev->roc_params.roc_ps_changed = 0;
-
-		ieee80211_remain_on_channel_expired(dev->hw);
 		mutex_unlock(&dev->mutex);
+		return -ENOTSUPP;
+	}
 
-		return 0;
+	/* Inform FW that ROC is started:
+	 * For pure TX we send OFFCHANNEL_TX so that driver can terminate ROC
+	 * For Tx + Rx we use NORMAL, FW will terminate ROC based on duration.
+	 */
+	if (duration != 10 && type == ROC_TYPE_OFFCHANNEL_TX)
+		type = ROC_TYPE_NORMAL;
 
-	} while (0);
+	/* uvif is in connected state
+	 */
+	if (uvif->chanctx) {
+		rcu_read_lock();
 
-	DEBUG_LOG("%s:%d Programming the Channel Success:%d\n",
-		  __func__, __LINE__,
-		  dev->chan_prog_done);
+		vif_chanctx =
+			rcu_dereference(dev->chanctx[uvif->chanctx->index]);
 
-	/* Inform FW that ROC is started */
-	uccp420wlan_prog_roc(ROC_START, pri_chnl_num, duration);
+		/* AS ROC frames are MGMT frames, checking only for Primary
+		 * Channel.
+		 */
+		if (vif_chanctx->def.chan->center_freq == channel->center_freq)
+			need_offchan = false;
 
-	ieee80211_queue_delayed_work(hw,
-				     &dev->roc_complete_work,
-				     msecs_to_jiffies(duration));
+		rcu_read_unlock();
+	}
 
-	dev->roc_params.roc_in_progress = 1;
+	DEBUG_LOG("%s-80211IF: need_offchan: %d\n", dev->name, need_offchan);
+	dev->roc_params.need_offchan = need_offchan;
 
-	ieee80211_ready_on_channel(dev->hw);
+	if (need_offchan) {
+		/* Different chan context than the uvif */
+		off_chanctx = kmalloc(sizeof(struct umac_chanctx),
+				      GFP_KERNEL);
+
+		if (!off_chanctx) {
+			pr_err("%s: Unable to alloc mem for channel context\n",
+			       __func__);
+			mutex_unlock(&dev->mutex);
+			return -ENOMEM;
+		}
+
+		/** Currently OFFCHAN is limited to handling ROC case
+		 *  but it is meant for a generic case.
+		 *  ideally we should look for existing offchan context
+		 *  and re-use/create.
+		 */
+		for (i = 0; i < MAX_OFF_CHANCTX; i++) {
+			if (!dev->off_chanctx[i]) {
+				off_chanctx_id = i;
+				break;
+			}
+		}
+
+		if (uvif->chanctx) {
+			ieee80211_stop_queues(hw);
+
+			hw_queue_map = BIT(WLAN_AC_BK) |
+				BIT(WLAN_AC_BE) |
+				BIT(WLAN_AC_VI) |
+				BIT(WLAN_AC_VO) |
+				BIT(WLAN_AC_BCN);
+
+			uccp420_flush_vif_queues(dev,
+					uvif,
+					uvif->chanctx->index,
+					hw_queue_map,
+					UMAC_VIF_CHANCTX_TYPE_OPER);
+		}
+
+
+		off_chanctx->index = OFF_CHANCTX_IDX_BASE + off_chanctx_id;
+		dev->roc_off_chanctx_idx = off_chanctx_id;
+		INIT_LIST_HEAD(&off_chanctx->vifs);
+		off_chanctx->nvifs = 0;
+
+		if (uvif->chanctx) {
+			/* Delete the uvif from OP channel list */
+			list_del_init(&uvif->list);
+		}
+		/* Add the vif to the off_chanctx */
+		list_add_tail(&uvif->list, &off_chanctx->vifs);
+		off_chanctx->nvifs++;
+		rcu_assign_pointer(dev->off_chanctx[off_chanctx_id],
+				   off_chanctx);
+		synchronize_rcu();
+
+
+		/* Move the channel context */
+		spin_lock_bh(&dev->chanctx_lock);
+		dev->curr_chanctx_idx = off_chanctx->index;
+		spin_unlock_bh(&dev->chanctx_lock);
+	} else {
+		/* Same channel context, just update off_chanctx
+		 * to chanctx
+		 */
+		off_chanctx = uvif->chanctx;
+
+		for (i = 0; i < MAX_OFF_CHANCTX; i++) {
+			if (!dev->off_chanctx[i]) {
+				off_chanctx_id = i;
+				break;
+			}
+		}
+		dev->roc_off_chanctx_idx = off_chanctx->index;
+		rcu_assign_pointer(dev->off_chanctx[off_chanctx_id],
+				   off_chanctx);
+		synchronize_rcu();
+	}
+	spin_lock_irqsave(&tx->lock, flags);
+	uvif->off_chanctx = off_chanctx;
+	spin_unlock_irqrestore(&tx->lock, flags);
+
+	uccp420wlan_prog_roc(ROC_START, pri_chnl_num, duration, type);
+
+	if (uvif->chanctx)
+		ieee80211_wake_queues(hw);
 
 	mutex_unlock(&dev->mutex);
 
@@ -1467,34 +1554,34 @@ static int remain_on_channel(struct ieee80211_hw *hw,
 
 static int cancel_remain_on_channel(struct ieee80211_hw *hw)
 {
-	int i = 0;
 	struct mac80211_dev *dev = (struct mac80211_dev *)hw->priv;
+	int ret = 0;
 
 	mutex_lock(&dev->mutex);
 
 	if (dev->roc_params.roc_in_progress) {
-		cancel_delayed_work_sync(&dev->roc_complete_work);
+		dev->cancel_hw_roc_done = 0;
+		dev->cancel_roc = 1;
+		DEBUG_LOG("%s-80211IF: Cancelling HW ROC....\n", dev->name);
 
-		/* Put the chip back to its original state */
-		for (i = 0; i < MAX_VIFS; i++) {
-			if (!(dev->active_vifs & (1 << i)))
-				continue;
+		uccp420wlan_prog_roc(ROC_STOP, 0, 0, 0);
 
-			uccp420wlan_prog_ps_state(i,
-						  dev->if_mac_addresses[i].addr,
-						  dev->power_save);
+		mutex_unlock(&dev->mutex);
+
+		if (!wait_for_cancel_hw_roc(dev)) {
+			DEBUG_LOG("%s-80211IF: Cancel HW ROC....done\n",
+				  dev->name);
+			ret = 0;
+		} else {
+			DEBUG_LOG("%s-80211IF: Cancel HW ROC..timedout\n",
+				  dev->name);
+			ret = -1;
 		}
-
-		DEBUG_LOG("%s:%d Coming back to Orig:%d\n",
-			  __func__, __LINE__,
-			  dev->power_save);
-
-		dev->roc_params.roc_in_progress = 0;
+	} else {
+		mutex_unlock(&dev->mutex);
 	}
 
-	mutex_unlock(&dev->mutex);
-
-	return 0;
+	return ret;
 }
 
 
@@ -1563,7 +1650,7 @@ static int img_resume(struct ieee80211_hw *hw)
 
 	if (uccp420wlan_prog_econ_ps_state(active_vif_index,
 					   PWRSAVE_STATE_AWAKE)) {
-		pr_err(" %s : Error Occured\n",
+		pr_err("%s : Error Occured\n",
 		       __func__);
 		mutex_unlock(&dev->mutex);
 		return -1;
@@ -1617,7 +1704,7 @@ static int img_suspend(struct ieee80211_hw *hw,
 	}
 
 	if (count != 1) {
-		pr_err("%s: Economy mode supported only for single VIF in STA mode\n",
+		pr_err("%s: Economy mode supp only for single VIF(STA mode)\n",
 		       __func__);
 		mutex_unlock(&dev->mutex);
 		return -1;
@@ -1731,6 +1818,9 @@ void uccp420wlan_scan_complete(void *context,
 			       unsigned int len)
 {
 	struct mac80211_dev *dev = (struct mac80211_dev *)context;
+	int i = 0;
+	struct ieee80211_vif *vif = NULL;
+	const char ra[] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 	/* DO NOT update the scan results through cfg80211 API's we just pass
 	 * the beacons and probe responses up and mac80211 will inform cfg80211
@@ -1749,6 +1839,25 @@ void uccp420wlan_scan_complete(void *context,
 		if (wifi->params.hw_scan_status != HW_SCAN_STATUS_NONE) {
 			dev->stats->umac_scan_complete++;
 			ieee80211_scan_completed(dev->hw, false);
+
+			/* WAR for TT_PRB0164. To be removed after patch
+			 *  submitted to kernel
+			 */
+			for (i = 0; i < MAX_VIFS; i++) {
+
+				if (!(dev->active_vifs & (1 << i)))
+					continue;
+
+				rcu_read_lock();
+				vif = rcu_dereference(dev->vifs[i]);
+				rcu_read_unlock();
+
+				if (vif->type != NL80211_IFTYPE_AP)
+					continue;
+
+				ieee80211_stop_tx_ba_cb_irqsafe(vif,
+						ra, IEEE80211_NUM_TIDS);
+			}
 
 			/* Keep track of HW Scan requests and compeltes */
 			wifi->params.hw_scan_status = HW_SCAN_STATUS_NONE;
@@ -1987,8 +2096,8 @@ static int add_chanctx(struct ieee80211_hw *hw,
 	}
 
 	DEBUG_LOG("%s: %d MHz\n",
-			 __func__,
-			 conf->def.chan->center_freq);
+		  __func__,
+		  conf->def.chan->center_freq);
 
 	mutex_lock(&dev->mutex);
 
@@ -2117,19 +2226,36 @@ static void unassign_vif_chanctx(struct ieee80211_hw *hw,
 	struct mac80211_dev *dev = NULL;
 	struct umac_vif *uvif = NULL;
 	struct umac_chanctx *ctx = NULL;
+	u32 hw_queue_map = 0;
+	int i = 0;
 
 	dev = hw->priv;
 	uvif = (struct umac_vif *)vif->drv_priv;
 	ctx = (struct umac_chanctx *)conf->drv_priv;
 
 	DEBUG_LOG("%s: addr: %pM, type: %d, p2p: %d chan: %d MHz\n",
-			 __func__,
-			 vif->addr,
-			 vif->type,
-			 vif->p2p,
-			 conf->def.chan->center_freq);
+		  __func__,
+		  vif->addr,
+		  vif->type,
+		  vif->p2p,
+		  conf->def.chan->center_freq);
 
 	mutex_lock(&dev->mutex);
+
+	/* We need to specifically handle flushing tx queues for the AP VIF
+	 * here (for STA VIF, mac80211 handles this via flush_queues)
+	 */
+	if (vif->type == NL80211_IFTYPE_AP) {
+		/* Flush all queues for this VIF */
+		for (i = 0; i < NUM_ACS; i++)
+			hw_queue_map |= BIT(i);
+
+		uccp420_flush_vif_queues(dev,
+					 uvif,
+					 uvif->chanctx->index,
+					 hw_queue_map,
+					 UMAC_VIF_CHANCTX_TYPE_OPER);
+	}
 
 	uvif->chanctx = NULL;
 
@@ -2154,24 +2280,12 @@ static void flush_queues(struct ieee80211_hw *hw,
 {
 	struct mac80211_dev *dev = NULL;
 	struct umac_vif *uvif = NULL;
-	struct umac_chanctx *ctx = NULL;
-	unsigned int chan_ctx_id = 0;
-	unsigned int queue = 0;
-	unsigned int pending = 0;
-	int count = 0;
-	int peer_id = -1;
+	u32 hw_queue_map = 0;
 	int i = 0;
-	unsigned long flags = 0;
-	struct sk_buff_head *pend_pkt_q = NULL;
-	struct tx_config *tx = NULL;
-	struct ieee80211_sta *sta = NULL;
-	struct umac_sta *usta = NULL;
 
 	dev = hw->priv;
 
 	mutex_lock(&dev->mutex);
-
-	tx = &dev->tx;
 
 	if (!vif)
 		goto out;
@@ -2181,75 +2295,21 @@ static void flush_queues(struct ieee80211_hw *hw,
 	if (!uvif->chanctx)
 		goto out;
 
-	if (dev->num_active_chanctx != 2) {
-		DEBUG_LOG("%s-80211IF: Flush is only supported for TSMC case\n",
-			  __func__);
-		goto out;
+	/* Convert the mac80211 queue map to our hw queue map */
+	for (i = 0; i < IEEE80211_NUM_ACS; i++) {
+		if (queues & BIT(i))
+			hw_queue_map |= BIT(tx_queue_map(i));
 	}
-
-	ctx = uvif->chanctx;
-	chan_ctx_id = ctx->index;
-
-	for (queue = 0; queue < WLAN_AC_MAX_CNT; queue++) {
-		if (!((1 << queue) & queues))
-			continue;
-
-check_tokens_flush_complete:
-	pending = 0;
-
-	spin_lock_irqsave(&tx->lock, flags);
-	rcu_read_lock();
-
-	for (i = 0; i < MAX_PEND_Q_PER_AC; i++) {
-		if (i < MAX_PEERS) {
-			sta = rcu_dereference(dev->peers[i]);
-
-			if (!sta)
-				continue;
-
-			usta = (struct umac_sta *)(sta->drv_priv);
-
-			if (usta->vif_index == uvif->vif_index)
-				peer_id = i;
-			else
-				continue;
-		} else if (i == uvif->vif_index) {
-			peer_id = uvif->vif_index;
-		} else
-			continue;
-
-		pend_pkt_q = &tx->pending_pkt[peer_id][queue];
-
-		/* Assuming all packets for the peer have same channel
-		 * context
-		 */
-		pending = skb_queue_len(pend_pkt_q);
-	}
-
-	rcu_read_unlock();
-	spin_unlock_irqrestore(&tx->lock, flags);
-
-	if (pending && (count < QUEUE_FLUSH_TIMEOUT_TICKS)) {
-		current->state = TASK_INTERRUPTIBLE;
-
-		if (0 == schedule_timeout(1))
-			count++;
-
-		goto check_tokens_flush_complete;
-	}
-
-	if (pending)
-		DEBUG_LOG("%s: failed for VIF: %d and Queue: %d, pending: %d\n",
-				__func__,
-				uvif->vif_index,
-				queue,
-				pending);
-	else
-		DEBUG_LOG("%s: Flush for VIF: %d and Queue: %d success\n",
-				__func__,
-				uvif->vif_index,
-				queue);
-	}
+	/* This op should not get called during ROC operation, so we can assume
+	 * that the vif_chanctx_type will be UMAC_VIF_CHANCTX_TYPE_OPER. As for
+	 * TSMC operation the VIF can only be associated to one channel context,
+	 * so we pass uvif->chanctx->index as the parameter for chanctx_idx
+	 */
+	uccp420_flush_vif_queues(dev,
+				 uvif,
+				 uvif->chanctx->index,
+				 hw_queue_map,
+				 UMAC_VIF_CHANCTX_TYPE_OPER);
 
 out:
 	mutex_unlock(&dev->mutex);
@@ -2331,6 +2391,7 @@ static int uccp420wlan_init(void)
 	}
 
 	dev = (struct mac80211_dev *)hw->priv;
+	memset(dev, 0, sizeof(struct mac80211_dev));
 
 	hwsim_class = class_create(THIS_MODULE, "uccp420");
 
@@ -2374,6 +2435,7 @@ static int uccp420wlan_init(void)
 	spin_lock_init(&dev->chanctx_lock);
 #endif
 
+	spin_lock_init(&dev->roc_lock);
 	dev->state = STOPPED;
 	dev->active_vifs = 0;
 	dev->txpower = DEFAULT_TX_POWER;
@@ -2391,6 +2453,7 @@ static int uccp420wlan_init(void)
 	dev->params = &wifi->params;
 	dev->stats = &wifi->stats;
 	dev->umac_proc_dir_entry = wifi->umac_proc_dir_entry;
+	dev->current_vif_count = 0;
 	dev->stats->system_rev = system_rev;
 #ifdef MULTI_CHAN_SUPPORT
 	dev->num_active_chanctx = 0;
@@ -2462,6 +2525,7 @@ static int proc_read_config(struct seq_file *m, void *v)
 	seq_puts(m, "\n");
 
 	seq_printf(m, "production_test = %d\n", wifi->params.production_test);
+	seq_printf(m, "bypass_vpd = %d\n", wifi->params.bypass_vpd);
 	seq_printf(m, "tx_fixed_mcs_indx = %d (%s)\n",
 		   wifi->params.tx_fixed_mcs_indx,
 		   (wifi->params.prod_mode_rate_flag &
@@ -2616,6 +2680,8 @@ static int proc_read_config(struct seq_file *m, void *v)
 		   wifi->params.payload_length);
 	seq_printf(m, "start_prod_mode = channel: %d\n",
 		   wifi->params.start_prod_mode);
+	seq_printf(m, "continuous_tx = %d\n",
+		   wifi->params.cont_tx);
 
 	if (ftm || wifi->params.production_test)
 		seq_printf(m, "set_tx_power = %d dB\n",
@@ -2915,6 +2981,14 @@ static int proc_read_mac_stats(struct seq_file *m, void *v)
 			   total_rssi_samples);
 
 	seq_puts(m, "************* LMAC STATS ***********\n");
+	seq_printf(m, "roc_start =%d\n",
+		   wifi->stats.roc_start);
+	seq_printf(m, "roc_stop =%d\n",
+		   wifi->stats.roc_stop);
+	seq_printf(m, "roc_complete =%d\n",
+		   wifi->stats.roc_complete);
+	seq_printf(m, "roc_stop_complete =%d\n",
+		   wifi->stats.roc_stop_complete);
 	/* TX related */
 	seq_printf(m, "tx_cmd_cnt =%d\n",
 		   wifi->stats.tx_cmd_cnt);
@@ -3115,6 +3189,12 @@ static ssize_t proc_write_config(struct file *file,
 				pr_err("Re-initializing UMAC ..\n");
 				uccp420wlan_init();
 			}
+		} else
+			pr_err("Invalid parameter value\n");
+	} else if (param_get_val(buf, "bypass_vpd=", &val)) {
+		if ((val == 0) || (val == 1)) {
+			if (wifi->params.bypass_vpd != val)
+				wifi->params.bypass_vpd = val;
 		} else
 			pr_err("Invalid parameter value\n");
 	} else if (param_get_val(buf, "num_vifs=", &val)) {
@@ -3708,6 +3788,13 @@ static ssize_t proc_write_config(struct file *file,
 			       (unsigned int) val,
 			       AUX_ADC_CHAIN1,
 			       AUX_ADC_CHAIN2);
+	} else if ((wifi->params.production_test) &&
+		param_get_val(buf, "continuous_tx=", &val)) {
+		if (val == 0 || val == 1) {
+			wifi->params.cont_tx = val;
+			uccp420wlan_cont_tx(val);
+		   } else
+			pr_err("Invalid tx_continuous parameter\n");
 	} else if ((wifi->params.production_test) &&
 		    param_get_val(buf, "start_prod_mode=", &val)) {
 			unsigned int pri_chnl_num = 0;

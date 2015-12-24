@@ -88,7 +88,8 @@ extern spinlock_t tsf_lock;
 #define TX_COMPLETE_TIMEOUT_TICKS msecs_to_jiffies(TX_COMPLETE_TIMEOUT)
 #define SCAN_ABORT_TIMEOUT 1000
 #define SCAN_ABORT_TIMEOUT_TICKS msecs_to_jiffies(SCAN_ABORT_TIMEOUT)
-
+#define CANCEL_HW_ROC_TIMEOUT 1000
+#define CANCEL_HW_ROC_TIMEOUT_TICKS msecs_to_jiffies(CANCEL_HW_ROC_TIMEOUT)
 
 #define DEFAULT_TX_ANT_SELECT 3 /* bitmap of antennas for tx, 3=> both first and
 				 * second antenna to be used
@@ -202,6 +203,8 @@ struct wifi_params {
 	int payload_length;
 	int start_prod_mode;
 	int init_prod;
+	unsigned char bypass_vpd;
+	unsigned int cont_tx;
 };
 
 struct cmd_send_recv_cnt {
@@ -334,6 +337,10 @@ struct wifi_stats {
 	unsigned int cts_received_mcp_cnt;
 
 	/*MAC Stats*/
+	unsigned int roc_start;
+	unsigned int roc_stop;
+	unsigned int roc_complete;
+	unsigned int roc_stop_complete;
 	/* TX related */
 	unsigned int tx_cmd_cnt; /* Num of TX commands received from host */
 	unsigned int tx_done_cnt; /* Num of Tx done events sent to host */
@@ -388,10 +395,12 @@ struct tx_pkt_info {
 	struct sk_buff_head pkt;
 	unsigned int hdr_len;
 	unsigned int queue;
+	unsigned int vif_index;
 	unsigned int rate[4];
 	unsigned int retries[4];
 	unsigned int curr_retries;
 	unsigned int max_retries;
+	int roc_peer_id;
 	bool adjusted_rates;
 };
 
@@ -410,11 +419,13 @@ struct tx_config {
 	unsigned int next_spare_token_ac;
 
 	/* Used to store the address of pending skbs per ac */
-	struct sk_buff_head pending_pkt[MAX_PEND_Q_PER_AC][NUM_ACS];
+	struct sk_buff_head pending_pkt[MAX_UMAC_VIF_CHANCTX_TYPES]
+				       [MAX_PEND_Q_PER_AC]
+				       [NUM_ACS];
 
 #ifdef MULTI_CHAN_SUPPORT
 	/* Peer which has the opportunity to xmit next on a queue */
-	unsigned int curr_peer_opp[MAX_CHANCTX][NUM_ACS];
+	unsigned int curr_peer_opp[MAX_CHANCTX + MAX_OFF_CHANCTX][NUM_ACS];
 #else
 	unsigned int curr_peer_opp[NUM_ACS];
 #endif
@@ -423,8 +434,9 @@ struct tx_config {
 	 * it will be used in tx complete.
 	 */
 #ifdef MULTI_CHAN_SUPPORT
-	unsigned char desc_chan_map[NUM_TX_DESCS];
-	struct tx_pkt_info pkt_info[MAX_CHANCTX][NUM_TX_DESCS];
+	int desc_chan_map[NUM_TX_DESCS];
+	struct tx_pkt_info pkt_info[MAX_CHANCTX + MAX_OFF_CHANCTX]
+				   [NUM_TX_DESCS];
 #else
 	struct tx_pkt_info pkt_info[NUM_TX_DESCS];
 #endif
@@ -462,17 +474,17 @@ struct econ_ps_cfg_status {
 #endif
 
 struct current_channel {
+	unsigned int pri_chnl_num;
 	unsigned int center_freq1;
 	unsigned int center_freq2;
 	unsigned int freq_band;
 	unsigned int ch_width;
-	unsigned int pri_chnl_num;
 };
 
 struct roc_params {
 	unsigned char roc_in_progress;
-	unsigned char roc_ps_changed;
-	unsigned char roc_chan_changed;
+	unsigned int roc_type;
+	bool need_offchan;
 	atomic_t roc_mgmt_tx_count;
 };
 
@@ -480,11 +492,12 @@ struct mac80211_dev {
 	struct proc_dir_entry *umac_proc_dir_entry;
 	struct device *dev;
 	struct mac_address if_mac_addresses[MAX_VIFS];
+	unsigned int current_vif_count;
 	unsigned int active_vifs;
 	struct mutex mutex;
 	int state;
 	int txpower;
-	unsigned char	mc_filters[MCST_ADDR_LIMIT][6];
+	unsigned char mc_filters[MCST_ADDR_LIMIT][6];
 	int mc_filter_count;
 
 	struct tasklet_struct proc_tx_tasklet;
@@ -504,6 +517,8 @@ struct mac80211_dev {
 	struct wifi_stats  *stats;
 	char name[20];
 	char scan_abort_done;
+	char cancel_hw_roc_done;
+	char cancel_roc;
 	char chan_prog_done;
 	char reset_complete;
 	int power_save; /* Will be set only when a single VIF in
@@ -517,12 +532,15 @@ struct mac80211_dev {
 				* when transmitting bcast frames in AP in IBSS
 				* modes
 				*/
+	spinlock_t roc_lock;
 	unsigned char tx_antenna;
 	unsigned char tx_last_beacon;
 	unsigned int rts_threshold;
 #ifdef MULTI_CHAN_SUPPORT
 	spinlock_t chanctx_lock;
 	struct ieee80211_chanctx_conf *chanctx[MAX_CHANCTX];
+	struct umac_chanctx *off_chanctx[MAX_OFF_CHANCTX];
+	int roc_off_chanctx_idx;
 	int curr_chanctx_idx;
 	int num_active_chanctx;
 #endif
@@ -564,6 +582,7 @@ struct umac_vif {
 #ifdef MULTI_CHAN_SUPPORT
 	struct list_head list;
 	struct umac_chanctx *chanctx;
+	struct umac_chanctx *off_chanctx;
 #endif
 };
 
@@ -585,15 +604,23 @@ struct umac_chanctx {
 
 #endif
 
+struct curr_peer_info {
+	int id;
+	int op_chan_idx;
+};
 
-extern int wait_for_scan_abort(struct mac80211_dev *dev);
-extern int wait_for_channel_prog_complete(struct mac80211_dev *dev);
-extern int uccp420wlan_prog_nw_selection(unsigned int nw_select_enabled,
-					 unsigned char *mac_addr);
+
 #ifdef MULTI_CHAN_SUPPORT
 void uccp420wlan_proc_ch_sw_event(struct umac_event_ch_switch *ch_sw_info,
 				  void *context);
 #endif
+extern int wait_for_cancel_hw_roc(struct mac80211_dev *dev);
+extern int wait_for_scan_abort(struct mac80211_dev *dev);
+extern int wait_for_channel_prog_complete(struct mac80211_dev *dev);
+extern int wait_for_tx_queue_flush_complete(struct mac80211_dev *dev,
+					    unsigned int token);
+extern int uccp420wlan_prog_nw_selection(unsigned int nw_select_enabled,
+					 unsigned char *mac_addr);
 extern int  uccp420wlan_core_init(struct mac80211_dev *dev, unsigned int ftm);
 extern void uccp420wlan_core_deinit(struct mac80211_dev *dev, unsigned int ftm);
 extern void uccp420wlan_vif_add(struct umac_vif  *uvif);
@@ -622,29 +649,42 @@ extern int __uccp420wlan_tx_frame(struct mac80211_dev *dev,
 				  bool retry);
 extern void uccp420wlan_tx_init(struct mac80211_dev *dev);
 extern void uccp420wlan_tx_deinit(struct mac80211_dev *dev);
-
+void uccp420wlan_tx_proc_send_pend_frms_all(struct mac80211_dev *dev,
+					   int chan_id);
 extern void proc_bss_info_changed(unsigned char *mac_addr, int value);
 extern void packet_generation(unsigned long data);
 extern int wait_for_reset_complete(struct mac80211_dev *dev);
 
-extern void uccp420wlan_tx_proc_pend_frms(struct mac80211_dev *dev,
+extern int uccp420wlan_tx_proc_pend_frms(struct mac80211_dev *dev,
 				   int queue,
 #ifdef MULTI_CHAN_SUPPORT
 				   int curr_chanctx_idx,
 #endif
-				   int peer_id,
 				   int token_id);
-int get_curr_peer_opp(struct mac80211_dev *dev,
+void free_token(struct mac80211_dev *dev,
+		int token_id,
+		int queue);
+
+struct curr_peer_info get_curr_peer_opp(struct mac80211_dev *dev,
 #ifdef MULTI_CHAN_SUPPORT
 		      int curr_chanctx_idx,
 #endif
 		      int queue);
+
+int uccp420_flush_vif_queues(struct mac80211_dev *dev,
+			     struct umac_vif *uvif,
+			     int chanctx_idx,
+			     unsigned int hw_queue_map,
+			     enum UMAC_VIF_CHANCTX_TYPE vif_chanctx_type);
 
 /* Beacon TimeStamp */
 __s32 __attribute__((weak)) frc_to_atu(__u32 frccnt, __u64 *patu, s32 dir);
 int __attribute__((weak)) get_evt_timer_freq(unsigned int *mask,
 						unsigned int *num,
 						unsigned int *denom);
+
+int tx_queue_map(int queue);
+int tx_queue_unmap(int queue);
 
 extern unsigned char *rf_params_vpd;
 extern int num_streams_vpd;

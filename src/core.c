@@ -117,6 +117,31 @@ check_scan_abort_complete:
 
 }
 
+int wait_for_cancel_hw_roc(struct mac80211_dev *dev)
+{
+	int count = 0;
+
+check_cancel_hw_roc_complete:
+	if (!dev->cancel_hw_roc_done && (count < CANCEL_HW_ROC_TIMEOUT_TICKS)) {
+		current->state = TASK_INTERRUPTIBLE;
+		if (0 == schedule_timeout(1))
+			count++;
+		goto check_cancel_hw_roc_complete;
+	}
+
+	if (!dev->cancel_hw_roc_done) {
+		pr_err("%s-UMAC: Warning: Didn't get CANCEL_HW_ROC_DONE after %ld timer ticks\n",
+		       dev->name,
+		       CANCEL_HW_ROC_TIMEOUT_TICKS);
+		return -1;
+	}
+
+	DEBUG_LOG("%s-UMAC: Cancel HW RoC complete after %d timer ticks\n",
+		   dev->name, count);
+
+	return 0;
+
+}
 
 int wait_for_channel_prog_complete(struct mac80211_dev *dev)
 {
@@ -142,6 +167,38 @@ check_ch_prog_complete:
 
 	DEBUG_LOG("%s-CORE: Channel Prog Complete after %d timer ticks\n",
 		  dev->name, count);
+
+	return 0;
+
+}
+
+int wait_for_tx_queue_flush_complete(struct mac80211_dev *dev,
+				     unsigned int queue)
+{
+	int count = 0;
+
+check_tx_queue_flush_complete:
+	if (dev->tx.outstanding_tokens[queue] &&
+	    (count < QUEUE_FLUSH_TIMEOUT_TICKS)) {
+		current->state = TASK_INTERRUPTIBLE;
+		if (0 == schedule_timeout(1))
+			count++;
+		goto check_tx_queue_flush_complete;
+	}
+
+	if (dev->tx.outstanding_tokens[queue]) {
+		pr_err("%s-UMAC: Warning: Tx Queue %d flush failed pending: %d after %ld timer ticks\n",
+		       dev->name,
+		       queue,
+		       dev->tx.outstanding_tokens[queue],
+		       QUEUE_FLUSH_TIMEOUT_TICKS);
+		return -1;
+	}
+
+	DEBUG_LOG("%s-UMAC: Flushed Tx queue %d in %d timer ticks\n",
+		  dev->name,
+		  queue,
+		  count);
 
 	return 0;
 
@@ -880,6 +937,10 @@ void uccp420wlan_mac_stats(struct umac_event_mac_stats *mac_stats,
 	struct mac80211_dev *dev = (struct mac80211_dev *)context;
 
 	/* TX related */
+	dev->stats->roc_start = mac_stats->roc_start;
+	dev->stats->roc_stop = mac_stats->roc_stop;
+	dev->stats->roc_complete = mac_stats->roc_complete;
+	dev->stats->roc_stop_complete = mac_stats->roc_stop_complete;
 	dev->stats->tx_cmd_cnt = mac_stats->tx_cmd_cnt;
 	dev->stats->tx_done_cnt = mac_stats->tx_done_cnt;
 	dev->stats->tx_edca_trigger_cnt = mac_stats->tx_edca_trigger_cnt;
@@ -1041,168 +1102,6 @@ static unsigned int get_real_ts2(unsigned int t2, unsigned int delta)
 		td = clock_mask + (t2 + 1) - clocks;
 
 	return td & clock_mask;
-}
-#endif
-
-
-#ifdef MULTI_CHAN_SUPPORT
-void uccp420wlan_proc_ch_sw_event(struct umac_event_ch_switch *ch_sw_info,
-				  void *context)
-{
-	struct mac80211_dev *dev = NULL;
-	int chan = 0;
-	int curr_freq = 0;
-	int chan_id = 0;
-	struct sk_buff_head *txq = NULL;
-	int txq_len = 0;
-	int i = 0;
-	int queue = 0;
-	unsigned long flags = 0;
-	int curr_bit = 0;
-	int pool_id = 0;
-	int ret = 0;
-	int peer_id = -1;
-	int ac = 0;
-	struct ieee80211_chanctx_conf *curr_chanctx = NULL;
-	struct tx_config *tx = NULL;
-
-	if (!ch_sw_info || !context) {
-		pr_err("%s: Invalid Parameters\n", __func__);
-		return;
-	}
-
-	dev = (struct mac80211_dev *)context;
-	chan = ch_sw_info->chan;
-	tx = &dev->tx;
-
-	rcu_read_lock();
-
-	for (i = 0; i < MAX_CHANCTX; i++) {
-		curr_chanctx = rcu_dereference(dev->chanctx[i]);
-
-		if (curr_chanctx) {
-			curr_freq = curr_chanctx->def.chan->center_freq;
-
-			if (ieee80211_frequency_to_channel(curr_freq) == chan) {
-				chan_id = i;
-				break;
-			}
-		}
-	}
-
-	rcu_read_unlock();
-
-	if (i == MAX_CHANCTX) {
-		pr_err("%s: Invalid Channel Context: chan: %d\n",
-		       __func__,
-		       chan);
-		return;
-	}
-
-
-	/* Switch to the new channel context */
-	spin_lock(&dev->chanctx_lock);
-	dev->curr_chanctx_idx = chan_id;
-	spin_unlock(&dev->chanctx_lock);
-
-	/* We now try to xmit any frames whose xmission got cancelled due to a
-	 * previous channel switch
-	 */
-	for (i = 0; i < NUM_TX_DESCS; i++) {
-		spin_lock_irqsave(&tx->lock, flags);
-
-		curr_bit = (i % TX_DESC_BUCKET_BOUND);
-		pool_id = (i / TX_DESC_BUCKET_BOUND);
-
-		if (test_and_set_bit(curr_bit, &tx->buf_pool_bmp[pool_id])) {
-			spin_unlock_irqrestore(&tx->lock, flags);
-			continue;
-		}
-
-		txq = &tx->pkt_info[chan_id][i].pkt;
-		txq_len = skb_queue_len(txq);
-		queue = tx->pkt_info[chan_id][i].queue;
-
-		if (!txq_len) {
-			/* Reserved token */
-			if (i < (NUM_TX_DESCS_PER_AC * NUM_ACS)) {
-				queue = (i % NUM_ACS);
-				peer_id = get_curr_peer_opp(dev,
-							    chan_id,
-							    queue);
-
-				if (peer_id == -1) {
-					/* Mark the token as available */
-					__clear_bit(curr_bit,
-						    &tx->buf_pool_bmp[pool_id]);
-
-					spin_unlock_irqrestore(&tx->lock,
-							       flags);
-					continue;
-				}
-
-			/* Spare token */
-			} else {
-				for (ac = WLAN_AC_VO; ac >= 0; ac--) {
-					peer_id = get_curr_peer_opp(dev,
-								    chan_id,
-								    ac);
-
-					if (peer_id != -1) {
-						queue = ac;
-						break;
-					}
-				}
-
-				if (ac < 0) {
-					/* Mark the token as available */
-					__clear_bit(curr_bit,
-						    &tx->buf_pool_bmp[pool_id]);
-
-					spin_unlock_irqrestore(&tx->lock,
-							       flags);
-					continue;
-				}
-			}
-
-			uccp420wlan_tx_proc_pend_frms(dev,
-						      queue,
-						      chan_id,
-						      peer_id,
-						      i);
-
-			tx->outstanding_tokens[queue]++;
-
-		}
-
-		spin_unlock_irqrestore(&tx->lock, flags);
-
-		ret = __uccp420wlan_tx_frame(dev,
-					     queue,
-					     i,
-					     chan_id,
-					     0,
-					     0); /* TODO: Currently sending 0
-						    since this param is not used
-						    as expected in the orig
-						    code for multiple frames etc
-						    Need to set this
-						    properly when the orig code
-						    logic is corrected
-						  */
-		if (ret < 0) {
-			/* SDK: Check if we need to clear the TX bitmap and
-			 * desc_chan_map here
-			 */
-			pr_err("%s: Queueing of TX frame to FW failed\n",
-			       __func__);
-		} else {
-			spin_lock_irqsave(&tx->lock, flags);
-			tx->desc_chan_map[i] = chan_id;
-			spin_unlock_irqrestore(&tx->lock, flags);
-		}
-
-	}
 }
 #endif
 
