@@ -45,6 +45,7 @@
 #include <linux/module.h>
 #include <linux/clk.h>
 #include <linux/iio/consumer.h>
+#include <linux/proc_fs.h>
 
 #define COMMAND_START_MAGIC 0xDEAD
 

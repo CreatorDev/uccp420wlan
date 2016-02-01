@@ -1236,18 +1236,18 @@ static void init_hw(struct ieee80211_hw *hw)
 		       sizeof(struct ieee80211_iface_combination));
 	hw->wiphy->n_iface_combinations = num_if_comb;
 
-	hw->flags = IEEE80211_HW_SIGNAL_DBM | IEEE80211_HW_SUPPORTS_PS;
-	hw->flags |= IEEE80211_HW_HOST_BROADCAST_PS_BUFFERING;
-	hw->flags |= IEEE80211_HW_AMPDU_AGGREGATION;
-	hw->flags |= IEEE80211_HW_MFP_CAPABLE;
-	hw->flags |= IEEE80211_HW_REPORTS_TX_ACK_STATUS;
+	ieee80211_hw_set(hw, SIGNAL_DBM);
+	ieee80211_hw_set(hw, SUPPORTS_PS);
+	ieee80211_hw_set(hw, HOST_BROADCAST_PS_BUFFERING);
+	ieee80211_hw_set(hw, AMPDU_AGGREGATION);
+	ieee80211_hw_set(hw, MFP_CAPABLE);
+	ieee80211_hw_set(hw, REPORTS_TX_ACK_STATUS);
 
 	if (wifi->params.dot11a_support)
-		hw->flags |= IEEE80211_HW_SPECTRUM_MGMT;
+		ieee80211_hw_set(hw, SPECTRUM_MGMT);
 
-	hw->flags |= IEEE80211_HW_SUPPORTS_PER_STA_GTK;
-
-	hw->flags |= IEEE80211_HW_CONNECTION_MONITOR;
+	ieee80211_hw_set(hw, SUPPORTS_PER_STA_GTK);
+	ieee80211_hw_set(hw, CONNECTION_MONITOR);
 
 	hw->wiphy->max_scan_ssids = MAX_NUM_SSIDS; /* 4 */
 	 /* Low priority bg scan */
@@ -1311,7 +1311,7 @@ static int ampdu_action(struct ieee80211_hw *hw,
 				struct ieee80211_vif *vif,
 				enum ieee80211_ampdu_mlme_action action,
 				struct ieee80211_sta *sta,
-				u16 tid, u16 *ssn, u8 buf_size)
+				u16 tid, u16 *ssn, u8 buf_size, bool amsdu)
 {
 	int ret = 0;
 	unsigned int val = 0;
@@ -2334,7 +2334,6 @@ static struct ieee80211_ops ops = {
 	.bss_info_changed   = bss_info_changed,
 	.set_tim            = NULL,
 	.set_key            = set_key,
-	.get_tkip_seq       = NULL,
 	.tx_last_beacon     = tx_last_beacon,
 	.ampdu_action       = ampdu_action,
 	.set_antenna	    = set_antenna,
