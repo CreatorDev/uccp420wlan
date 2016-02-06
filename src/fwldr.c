@@ -74,10 +74,6 @@ static void dir_mem_set(unsigned int addr,
 			unsigned char data,
 			unsigned int len);
 
-static void dir_mem_read(unsigned int addr,
-			 unsigned int *data,
-			 unsigned int len);
-
 static void dir_mem_write(unsigned int addr,
 			 unsigned int data);
 
@@ -88,10 +84,6 @@ static void core_mem_cpy(unsigned int addr,
 static void core_mem_set(unsigned int addr,
 			 unsigned int data,
 			 unsigned int len);
-
-static void core_mem_read(unsigned int addr,
-			  unsigned int *data,
-			  unsigned int len);
 
 /* dir_mem_cpy
  *
@@ -231,7 +223,7 @@ static void dir_mem_set(unsigned int addr,
 /* Perform 'len' 32 bit reads from a UCCP memory location 'addr'
  * 'addr' is always a 4 byte aligned address
  */
-static void dir_mem_read(unsigned int addr,
+void dir_mem_read(unsigned int addr,
 			 unsigned int *data,
 			 unsigned int len)
 {
@@ -320,7 +312,7 @@ static void core_mem_set(unsigned int addr,
 }
 
 
-static void core_mem_read(unsigned int addr,
+void core_mem_read(unsigned int addr,
 			  unsigned int *data,
 			  unsigned int len)
 {
@@ -353,7 +345,15 @@ static void core_mem_read(unsigned int addr,
 
 }
 
+int rpudump_init(void)
+{
+	fpriv = &fpv;
 
+	hal_ops.request_mem_regions(&fpriv->gram_addr,
+				    &fpriv->sysbus_addr,
+				    &fpriv->gram_b4_addr);
+	return 0;
+}
 
 int fwldr_load_fw(const unsigned char *fw_data, int i)
 {
@@ -362,8 +362,9 @@ int fwldr_load_fw(const unsigned char *fw_data, int i)
 
 	fpriv = &fpv;
 	hal_ops.request_mem_regions(&fpriv->gram_addr,
-				    &fpriv->core_addr,
+				    &fpriv->sysbus_addr,
 				    &fpriv->gram_b4_addr);
+
 
 	fwldr_soft_reset(LTP_THREAD_NUM);
 
@@ -1184,11 +1185,6 @@ static int fwldr_wait_for_completion(void)
 
 	if (i == 1000)
 		result = 0;
-
-	rw_v.addr = UCCP_GRAM_BASE + UCCP_THRD_EXEC_SIG_OFFSET;
-	rw_v.val = 0x00;
-
-	fwldr_config_write(rw_v.addr, rw_v.val);
 
 	return result;
 }

@@ -37,12 +37,16 @@
 					 */
 
 #define NUM_TX_DESCS    ((NUM_ACS *  NUM_TX_DESCS_PER_AC) + NUM_SPARE_TX_DESCS)
-#define MAX_AMPDU_SUBFRAME_SIZE	1500	/*max size of a sub-frame in an AMPDU*/
-#define MAX_SUBFRAMES_IN_AMPDU	24	/*max no of sub frames in an AMPDU*/
+/* Max size of a sub-frame in an AMPDU */
+#define MAX_AMPDU_SUBFRAME_SIZE 1500
+
+/* Max no of sub frames in an AMPDU */
+#define MAX_SUBFRAMES_IN_AMPDU_HT 24	/* HT */
+#define MAX_SUBFRAMES_IN_AMPDU_VHT 24	/* VHT */
 
 #define NUM_CTRL_DESCS		2
 
-#define NUM_RX_BUFS_2K		64
+#define NUM_RX_BUFS_2K		256
 #define NUM_RX_BUFS_12K		16
 
 #endif /* _UCCP420WLAN_DESCRIPTOR_H_ */

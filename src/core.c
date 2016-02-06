@@ -28,6 +28,28 @@
 
 #define UMAC_PRINT(fmt, args...) pr_debug(fmt, ##args)
 
+#define UCCP_DEBUG_CORE(fmt, ...)                           \
+do {                                                                    \
+		if (uccp_debug & UCCP_DEBUG_CORE)                       \
+			pr_debug(fmt, ##__VA_ARGS__);  \
+} while (0)
+
+#define UCCP_DEBUG_RX(fmt, ...)                           \
+do {                                                                    \
+		if ((uccp_debug & UCCP_DEBUG_RX) && net_ratelimit())     \
+			pr_debug(fmt, ##__VA_ARGS__);  \
+} while (0)
+
+
+#define UCCP_DEBUG_DUMP_RX(fmt, ...)                           \
+do {                                                                    \
+		if (uccp_debug & UCCP_DEBUG_DUMP_RX)                       \
+			print_hex_dump(KERN_DEBUG, fmt, ##__VA_ARGS__);  \
+} while (0)
+
+
+#define DUMP_RX (uccp_debug & UCCP_DEBUG_DUMP_RX)
+
 spinlock_t tsf_lock;
 
 unsigned char bss_addr[6] = {72, 14, 29, 35, 31, 52};
@@ -110,8 +132,9 @@ check_scan_abort_complete:
 		return -1;
 	}
 
-	UMAC_PRINT("%s-UMAC: Scan abort complete after %d timer ticks\n",
-		   dev->name, count);
+	UCCP_DEBUG_SCAN("%s-UMAC: Scan abort complete after %d timer ticks\n",
+					dev->name,
+					count);
 
 	return 0;
 
@@ -136,8 +159,9 @@ check_cancel_hw_roc_complete:
 		return -1;
 	}
 
-	DEBUG_LOG("%s-UMAC: Cancel HW RoC complete after %d timer ticks\n",
-		   dev->name, count);
+	UCCP_DEBUG_ROC("%s-UMAC: Cancel HW RoC complet after %d timer ticks\n",
+					dev->name,
+					count);
 
 	return 0;
 
@@ -165,8 +189,8 @@ check_ch_prog_complete:
 		return -1;
 	}
 
-	DEBUG_LOG("%s-CORE: Channel Prog Complete after %d timer ticks\n",
-		  dev->name, count);
+	UCCP_DEBUG_CORE("%s-UMAC: Channel Prog Complete after %d timer ticks\n",
+			dev->name, count);
 
 	return 0;
 
@@ -195,10 +219,10 @@ check_tx_queue_flush_complete:
 		return -1;
 	}
 
-	DEBUG_LOG("%s-UMAC: Flushed Tx queue %d in %d timer ticks\n",
-		  dev->name,
-		  queue,
-		  count);
+	UCCP_DEBUG_ROC("%s-UMAC:", dev->name);
+	UCCP_DEBUG_ROC("Flushed Tx queue %d successfully in %d timer ticks\n",
+		       queue,
+			   count);
 
 	return 0;
 
@@ -315,7 +339,6 @@ static void vif_bcn_timer_expiry(unsigned long data)
 	struct umac_vif *uvif = (struct umac_vif *)data;
 	struct sk_buff *skb, *temp;
 	struct sk_buff_head bcast_frames;
-	unsigned long flags;
 
 	if (uvif->vif->bss_conf.enable_beacon == false)
 		return;
@@ -348,7 +371,7 @@ static void vif_bcn_timer_expiry(unsigned long data)
 		if (temp)
 			temp->priority = 0;
 
-		spin_lock_irqsave(&uvif->dev->bcast_lock, flags);
+		spin_lock_bh(&uvif->dev->bcast_lock);
 
 		while ((skb = skb_dequeue(&bcast_frames))) {
 			/* For a Beacon queue we will let the frames pass
@@ -367,8 +390,12 @@ static void vif_bcn_timer_expiry(unsigned long data)
 					     true);
 		}
 
-		spin_unlock_irqrestore(&uvif->dev->bcast_lock, flags);
+		spin_unlock_bh(&uvif->dev->bcast_lock);
 
+		if (uvif->vif->csa_active) {
+			if (ieee80211_csa_is_complete(uvif->vif))
+				ieee80211_csa_finish(uvif->vif);
+		}
 	} else {
 		skb = ieee80211_beacon_get(uvif->dev->hw, uvif->vif);
 
@@ -399,7 +426,7 @@ reschedule_timer:
 int uccp420wlan_core_init(struct mac80211_dev *dev, unsigned int ftm)
 {
 
-	DEBUG_LOG("%s-CORE: Init called\n", dev->name);
+	UCCP_DEBUG_CORE("%s-UMAC: Init called\n", dev->name);
 	spin_lock_init(&tsf_lock);
 	uccp420wlan_lmac_if_init(dev, dev->name);
 
@@ -408,21 +435,23 @@ int uccp420wlan_core_init(struct mac80211_dev *dev, unsigned int ftm)
 
 	UMAC_PRINT("%s-UMAC: Reset (ENABLE)\n", dev->name);
 
-	if (hal_ops.start(dev->umac_proc_dir_entry))
+	if (hal_ops.start())
 		goto lmac_deinit;
-	if (ftm)
-		uccp420wlan_prog_reset(LMAC_ENABLE, LMAC_MODE_FTM);
-	else
-		uccp420wlan_prog_reset(LMAC_ENABLE, LMAC_MODE_NORMAL);
-
-	if (wait_for_reset_complete(dev) < 0)
-		goto hal_stop;
 
 	if (hal_ops.init_bufs(NUM_TX_DESCS,
 			      NUM_RX_BUFS_2K,
 			      NUM_RX_BUFS_12K,
 			      dev->params->max_data_size) < 0)
 		goto hal_stop;
+
+	if (ftm)
+		uccp420wlan_prog_reset(LMAC_ENABLE, LMAC_MODE_FTM);
+	else
+		uccp420wlan_prog_reset(LMAC_ENABLE, LMAC_MODE_NORMAL);
+
+	if (wait_for_reset_complete(dev) < 0)
+		goto hal_deinit_bufs;
+
 
 	uccp420wlan_prog_btinfo(dev->params->bt_state);
 	uccp420wlan_prog_global_cfg(512, /* Rx MSDU life time in msecs */
@@ -435,8 +464,10 @@ int uccp420wlan_core_init(struct mac80211_dev *dev, unsigned int ftm)
 	uccp420wlan_tx_init(dev);
 
 	return 0;
+hal_deinit_bufs:
+	hal_ops.deinit_bufs();
 hal_stop:
-	hal_ops.stop(dev->umac_proc_dir_entry);
+	hal_ops.stop();
 lmac_deinit:
 	uccp420wlan_lmac_if_deinit();
 	return -1;
@@ -445,7 +476,7 @@ lmac_deinit:
 
 void uccp420wlan_core_deinit(struct mac80211_dev *dev, unsigned int ftm)
 {
-	DEBUG_LOG("%s-CORE: De-init called\n", dev->name);
+	UCCP_DEBUG_CORE("%s-UMAC: De-init called\n", dev->name);
 
 	/* De initialize tx  and disable LMAC*/
 	uccp420wlan_tx_deinit(dev);
@@ -464,7 +495,7 @@ void uccp420wlan_core_deinit(struct mac80211_dev *dev, unsigned int ftm)
 
 	uccp420_lmac_if_free_outstnding();
 
-	hal_ops.stop(dev->umac_proc_dir_entry);
+	hal_ops.stop();
 	hal_ops.deinit_bufs();
 
 	uccp420wlan_lmac_if_deinit();
@@ -476,8 +507,10 @@ void uccp420wlan_vif_add(struct umac_vif *uvif)
 	unsigned int type;
 	struct ieee80211_conf *conf = &uvif->dev->hw->conf;
 
-	DEBUG_LOG("%s-CORE: Add VIF %d Type = %d\n",
-		   uvif->dev->name, uvif->vif_index, uvif->vif->type);
+	UCCP_DEBUG_CORE("%s-UMAC: Add VIF %d Type = %d\n",
+		   uvif->dev->name,
+		   uvif->vif_index,
+		   uvif->vif->type);
 
 	uvif->config.atim_window = uvif->config.bcn_lost_cnt =
 		uvif->config.aid = 0;
@@ -559,10 +592,10 @@ void uccp420wlan_vif_remove(struct umac_vif *uvif)
 {
 	struct sk_buff *skb;
 	unsigned int type;
-	unsigned long flags;
 
-	DEBUG_LOG("%s-CORE: Remove VIF %d called\n", uvif->dev->name,
-		   uvif->vif_index);
+	UCCP_DEBUG_CORE("%s-UMAC: Remove VIF %d called\n",
+					uvif->dev->name,
+					uvif->vif_index);
 
 	switch (uvif->vif->type) {
 	case NL80211_IFTYPE_STATION:
@@ -585,12 +618,12 @@ void uccp420wlan_vif_remove(struct umac_vif *uvif)
 	del_timer(&uvif->driver_tput_timer);
 #endif
 
-	spin_lock_irqsave(&uvif->noa_que.lock, flags);
+	spin_lock_bh(&uvif->noa_que.lock);
 
 	while ((skb = __skb_dequeue(&uvif->noa_que)))
 		dev_kfree_skb(skb);
 
-	spin_unlock_irqrestore(&uvif->noa_que.lock, flags);
+	spin_unlock_bh(&uvif->noa_que.lock);
 
 	uccp420wlan_prog_vif_ctrl(uvif->vif_index,
 				  uvif->vif->addr,
@@ -620,9 +653,11 @@ void uccp420wlan_vif_set_edca_params(unsigned short queue,
 		break;
 	}
 
-	DEBUG_LOG("%s-CORE:Set EDCA params, VIF %d, Val: %d, %d, %d, %d, %d\n",
-		   uvif->dev ? uvif->dev->name : 0, uvif->vif_index, queue,
-		   params->aifs, params->txop, params->cwmin, params->cwmax);
+	UCCP_DEBUG_CORE("%s-UMAC:Set EDCA params for VIF %d,",
+		   uvif->dev ? uvif->dev->name : 0, uvif->vif_index);
+	UCCP_DEBUG_CORE(" Values: %d, %d, %d, %d, %d\n",
+		   queue, params->aifs, params->txop,
+		   params->cwmin, params->cwmax);
 
 	if (uvif->dev->params->production_test == 0) {
 		/* arbitration interframe space [0..255] */
@@ -677,8 +712,8 @@ void uccp420wlan_vif_bss_info_changed(struct umac_vif *uvif,
 	unsigned int bform_enable = 0;
 	unsigned int bform_per = 0;
 
-	DEBUG_LOG("%s-CORE: BSS INFO changed %d, %d, %d\n", uvif->dev->name,
-		   uvif->vif_index, uvif->vif->type, changed);
+	UCCP_DEBUG_CORE("%s-CORE: BSS INFO changed %d, %d, %d\n",
+		uvif->dev->name, uvif->vif_index, uvif->vif->type, changed);
 
 
 	if (changed & BSS_CHANGED_BSSID)
@@ -736,8 +771,9 @@ void uccp420wlan_vif_bss_info_changed(struct umac_vif *uvif,
 			bform_per = uvif->dev->params->vht_beamform_period;
 
 			if (bss_conf->assoc) {
-				DEBUG_LOG("%s-CORE: AID %d, CAPS 0x%04x\n",
-					   uvif->dev->name, bss_conf->aid,
+				UCCP_DEBUG_CORE("%s-CORE: AID %d,",
+					   uvif->dev->name, bss_conf->aid);
+				UCCP_DEBUG_CORE(" CAPS 0x%04x\n",
 					   bss_conf->assoc_capability |
 					   (bss_conf->qos << 9));
 
@@ -780,7 +816,8 @@ void uccp420wlan_vif_bss_info_changed(struct umac_vif *uvif,
 
 				uccp420wlan_prog_vht_bform(VHT_BEAMFORM_DISABLE,
 							   bform_per);
-
+				uvif->dev->params->
+					sync[uvif->vif_index].status = 0;
 			}
 		}
 
@@ -880,54 +917,9 @@ void uccp420wlan_mib_stats(struct umac_event_mib_stats *mib_stats,
 {
 	struct mac80211_dev *dev = (struct mac80211_dev *)context;
 
-	dev->stats->ed_cnt = mib_stats->ed_cnt;
-	dev->stats->mpdu_cnt = mib_stats->mpdu_cnt;
-	dev->stats->ofdm_crc32_pass_cnt = mib_stats->ofdm_crc32_pass_cnt;
-	dev->stats->ofdm_crc32_fail_cnt = mib_stats->ofdm_crc32_fail_cnt;
-	dev->stats->dsss_crc32_pass_cnt = mib_stats->dsss_crc32_pass_cnt;
-	dev->stats->dsss_crc32_fail_cnt = mib_stats->dsss_crc32_fail_cnt;
-	dev->stats->mac_id_pass_cnt = mib_stats->mac_id_pass_cnt;
-	dev->stats->mac_id_fail_cnt = mib_stats->mac_id_fail_cnt;
-	dev->stats->ofdm_corr_pass_cnt = mib_stats->ofdm_corr_pass_cnt;
-	dev->stats->ofdm_corr_fail_cnt = mib_stats->ofdm_corr_fail_cnt;
-	dev->stats->dsss_corr_pass_cnt = mib_stats->dsss_corr_pass_cnt;
-	dev->stats->dsss_corr_fail_cnt = mib_stats->dsss_corr_fail_cnt;
-	dev->stats->ofdm_s2l_fail_cnt = mib_stats->ofdm_s2l_fail_cnt;
-	dev->stats->lsig_fail_cnt = mib_stats->lsig_fail_cnt;
-	dev->stats->htsig_fail_cnt = mib_stats->htsig_fail_cnt;
-	dev->stats->vhtsiga_fail_cnt = mib_stats->vhtsiga_fail_cnt;
-	dev->stats->vhtsigb_fail_cnt = mib_stats->vhtsigb_fail_cnt;
-	dev->stats->nonht_ofdm_cnt = mib_stats->nonht_ofdm_cnt;
-	dev->stats->nonht_dsss_cnt = mib_stats->nonht_dsss_cnt;
-	dev->stats->mm_cnt = mib_stats->mm_cnt;
-	dev->stats->gf_cnt = mib_stats->gf_cnt;
-	dev->stats->vht_cnt = mib_stats->vht_cnt;
-	dev->stats->aggregation_cnt = mib_stats->aggregation_cnt;
-	dev->stats->non_aggregation_cnt = mib_stats->non_aggregation_cnt;
-	dev->stats->ndp_cnt = mib_stats->ndp_cnt;
-	dev->stats->ofdm_ldpc_cnt = mib_stats->ofdm_ldpc_cnt;
-	dev->stats->ofdm_bcc_cnt = mib_stats->ofdm_bcc_cnt;
-	dev->stats->midpacket_cnt = mib_stats->midpacket_cnt;
-	dev->stats->dsss_sfd_fail_cnt = mib_stats->dsss_sfd_fail_cnt;
-	dev->stats->dsss_hdr_fail_cnt = mib_stats->dsss_hdr_fail_cnt;
-	dev->stats->dsss_short_preamble_cnt =
-		mib_stats->dsss_short_preamble_cnt;
-	dev->stats->dsss_long_preamble_cnt = mib_stats->dsss_long_preamble_cnt;
-	dev->stats->sifs_event_cnt = mib_stats->sifs_event_cnt;
-	dev->stats->cts_cnt = mib_stats->cts_cnt;
-	dev->stats->ack_cnt = mib_stats->ack_cnt;
-	dev->stats->sifs_no_resp_cnt = mib_stats->sifs_no_resp_cnt;
-	dev->stats->unsupported_cnt = mib_stats->unsupported_cnt;
-	dev->stats->l1_corr_fail_cnt = mib_stats->l1_corr_fail_cnt;
-	dev->stats->phy_stats_reserved22 = mib_stats->phy_stats_reserved22;
-	dev->stats->phy_stats_reserved23 = mib_stats->phy_stats_reserved23;
-	dev->stats->phy_stats_reserved24 = mib_stats->phy_stats_reserved24;
-	dev->stats->phy_stats_reserved25 = mib_stats->phy_stats_reserved25;
-	dev->stats->phy_stats_reserved26 = mib_stats->phy_stats_reserved26;
-	dev->stats->phy_stats_reserved27 = mib_stats->phy_stats_reserved27;
-	dev->stats->phy_stats_reserved28 = mib_stats->phy_stats_reserved28;
-	dev->stats->phy_stats_reserved29 = mib_stats->phy_stats_reserved29;
-	dev->stats->phy_stats_reserved30 = mib_stats->phy_stats_reserved30;
+	memcpy(&dev->stats->ed_cnt,
+	       &mib_stats->ed_cnt,
+	       sizeof(struct umac_event_mib_stats));
 
 }
 
@@ -993,7 +985,6 @@ void uccp420wlan_noa_event(int event, struct umac_event_noa *noa, void *context,
 	struct mac80211_dev  *dev = (struct mac80211_dev *)context;
 	struct ieee80211_vif *vif;
 	struct umac_vif *uvif;
-	unsigned long flags;
 	bool transmit = false;
 #ifdef MULTI_CHAN_SUPPORT
 	int curr_chanctx_idx = -1;
@@ -1010,7 +1001,7 @@ void uccp420wlan_noa_event(int event, struct umac_event_noa *noa, void *context,
 
 	uvif = (struct umac_vif *)vif->drv_priv;
 
-	spin_lock_irqsave(&uvif->noa_que.lock, flags);
+	spin_lock_bh(&uvif->noa_que.lock);
 
 	if (event == FROM_TX) {
 		if (uvif->noa_active) {
@@ -1032,8 +1023,10 @@ void uccp420wlan_noa_event(int event, struct umac_event_noa *noa, void *context,
 		uvif->noa_active = noa->noa_active;
 
 		if (uvif->noa_active) {
-			pr_debug("%s: noa active = %d, ap_present = %d\n",
-				 dev->name, noa->noa_active, noa->ap_present);
+			UCCP_DEBUG_CORE("%s: noa active = %d, ",
+					dev->name, noa->noa_active);
+			UCCP_DEBUG_CORE("ap_present = %d\n",
+					noa->ap_present);
 
 			uvif->noa_tx_allowed = noa->ap_present;
 
@@ -1043,7 +1036,7 @@ void uccp420wlan_noa_event(int event, struct umac_event_noa *noa, void *context,
 					transmit = true;
 			}
 		} else {
-			pr_debug("%s: noa active = %d\n",
+			UCCP_DEBUG_CORE("%s: noa active = %d\n",
 				 dev->name, noa->noa_active);
 
 			uvif->noa_tx_allowed = 1;
@@ -1056,7 +1049,7 @@ void uccp420wlan_noa_event(int event, struct umac_event_noa *noa, void *context,
 		}
 	}
 
-	spin_unlock_irqrestore(&uvif->noa_que.lock, flags);
+	spin_unlock_bh(&uvif->noa_que.lock);
 
 	rcu_read_unlock();
 
@@ -1121,7 +1114,6 @@ void uccp420wlan_rx_frame(struct sk_buff *skb, void *context)
 	 * unused more_cmd_data in RX direction is used to indicate QoS/Non-Qos
 	 * frames
 	 */
-	/*pr_debug(" more command : %d\n", rx->hdr.more_cmd_data);*/
 	if (rx->hdr.more_cmd_data == 0) {
 		/* Non-QOS case*/
 		skb_pull(skb, sizeof(struct wlan_rx_pkt));
@@ -1134,14 +1126,6 @@ void uccp420wlan_rx_frame(struct sk_buff *skb, void *context)
 		skb_pull(skb, sizeof(struct wlan_rx_pkt) - 2);
 		skb_trim(skb, skb->len - 2);
 	}
-
-#ifdef DRIVER_DEBUG
-	pr_debug("%s-RX: RX frame, Len = %d, RSSI = %d, Rate = %d\n",
-		 dev->name, rx->pkt_length, rx->rssi, rx->rate_or_mcs);
-	/* print_hex_dump(KERN_DEBUG, " ", DUMP_PREFIX_NONE, 16 ,1, skb->data,
-	 * skb->len,1);
-	 */
-#endif
 
 	hdr = (struct ieee80211_hdr *)skb->data;
 
@@ -1182,9 +1166,7 @@ void uccp420wlan_rx_frame(struct sk_buff *skb, void *context)
 	if (rx->rate_flags & ENABLE_VHT_FORMAT) {
 		/* Rate */
 		if ((rx->rate_or_mcs & MARK_RATE_AS_MCS_INDEX) != 0x80) {
-#ifdef DRIVER_DEBUG
-			pr_info("Invalid VHT MCS Information\n");
-#endif
+			UCCP_DEBUG_RX("Invalid VHT MCS Information\n");
 			rx->rate_or_mcs = 0;/*default to MCS0*/
 		} else {
 			rx_status.rate_idx = (rx->rate_or_mcs & 0x7f);
@@ -1210,12 +1192,10 @@ void uccp420wlan_rx_frame(struct sk_buff *skb, void *context)
 	} else if (rx->rate_flags & ENABLE_11N_FORMAT) {
 		/* Rate */
 		if ((rx->rate_or_mcs & MARK_RATE_AS_MCS_INDEX) != 0x80) {
-#ifdef DRIVER_DEBUG
-			pr_info("Invalid HT MCS Information\n");
-#endif
-			   rx->rate_or_mcs = 0;/*default to MCS0*/
+			UCCP_DEBUG_RX("Invalid HT MCS Information\n");
+			rx->rate_or_mcs = 0;/*default to MCS0*/
 		} else {
-			   rx_status.rate_idx = (rx->rate_or_mcs & 0x7f);
+			rx_status.rate_idx = (rx->rate_or_mcs & 0x7f);
 		}
 
 		/* CBW */
@@ -1243,11 +1223,8 @@ void uccp420wlan_rx_frame(struct sk_buff *skb, void *context)
 				}
 			}
 		} else {
-#ifdef DRIVER_DEBUG
-			print_hex_dump(KERN_DEBUG, " ",
-				       DUMP_PREFIX_NONE, 16, 1, rx,
-				       sizeof(struct wlan_rx_pkt), 1);
-#endif
+			UCCP_DEBUG_DUMP_RX(" ", DUMP_PREFIX_NONE, 16, 1,
+				 rx, sizeof(struct wlan_rx_pkt), 1);
 			dev_kfree_skb_any(skb);
 			return;
 		}
@@ -1306,10 +1283,20 @@ void uccp420wlan_rx_frame(struct sk_buff *skb, void *context)
 				dev->params->sync[i].atu -= ldelta * 1000;
 				}
 				spin_unlock(&tsf_lock);
-				break;
 			}
 		}
 	}
+
+	UCCP_DEBUG_RX(KERN_DEBUG
+		      "%s-RX: RX frame, length = %d, RSSI = %d, rate = %d\n",
+		      dev->name,
+		      rx->pkt_length,
+		      rx->rssi,
+		      rx->rate_or_mcs);
+
+	UCCP_DEBUG_DUMP_RX(" ",
+			DUMP_PREFIX_NONE, 16, 1,
+			skb->data, skb->len, 1);
 
 	memcpy(IEEE80211_SKB_RXCB(skb), &rx_status, sizeof(rx_status));
 	ieee80211_rx(dev->hw, skb);

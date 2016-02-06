@@ -30,7 +30,22 @@
 #include "umac_if.h"
 #include "core.h"
 
+#define UCCP_DEBUG_IF(fmt, ...)                           \
+do {                                                                    \
+		if (uccp_debug & UCCP_DEBUG_IF)                       \
+			pr_debug(fmt, ##__VA_ARGS__);  \
+} while (0)
+
+#define UCCP_DEBUG_FAIL_SAFE(fmt, ...)                           \
+do {                                                                    \
+		if (uccp_debug & UCCP_DEBUG_FAIL_SAFE)                       \
+			pr_debug(fmt, ##__VA_ARGS__);  \
+} while (0)
+
 unsigned char wildcard_ssid[7] = "DIRECT-";
+#ifdef CONFIG_PM
+unsigned char rx_interrupt_status;
+#endif
 
 struct cmd_send_recv_cnt cmd_info;
 
@@ -476,12 +491,12 @@ static void get_rate(struct sk_buff *skb,
 #ifdef notyet
 			pkt_info->retries[index] =
 				txcmd->rate_retries[index];
-			DEBUG_LOG("%s-UMACTX : Using MINSTREL rates\n",
+			UCCP_DEBUG_IF("%s-UMACTX : Using MINSTREL rates\n",
 				  dev->name);
 		} else {
 			txcmd->rate_retries[index] =
 				pkt_info->retries[index];
-			DEBUG_LOG("%s-UMACTX : Using Adjusted rates\n",
+			UCCP_DEBUG_IF("%s-UMACTX : Using Adjusted rates\n",
 				  dev->name);
 		}
 #endif
@@ -499,13 +514,16 @@ static int uccp420wlan_send_cmd(unsigned char *buf,
 	struct sk_buff *nbuf;
 	struct lmac_if_data *p;
 	struct mac80211_dev *dev;
-	unsigned long irq_flags;
 
 	rcu_read_lock();
+
 	p = (struct lmac_if_data *)(rcu_dereference(lmac_if));
 
 	if (!p) {
+		pr_err("%s: Unable to retrieve lmac_if\n", __func__);
+#ifdef DRIVER_DEBUG
 		WARN_ON(1);
+#endif
 		rcu_read_unlock();
 		return -1;
 	}
@@ -518,7 +536,7 @@ static int uccp420wlan_send_cmd(unsigned char *buf,
 	}
 	hdr->id = id;
 	hdr->length = len;
-	DEBUG_LOG("%s-UMACIF: Sending command:%d, outstanding_cmds: %d\n",
+	UCCP_DEBUG_IF("%s-UMACIF: Sending command:%d, outstanding_cmds: %d\n",
 		     p->name, hdr->id, cmd_info.outstanding_ctrl_req);
 	hdr->descriptor_id = 0;
 	hdr->descriptor_id |= 0x0000ffff;
@@ -527,21 +545,21 @@ static int uccp420wlan_send_cmd(unsigned char *buf,
 	dev->stats->outstanding_cmd_cnt = cmd_info.outstanding_ctrl_req;
 
 	/* Take lock to make the control commands sequential in case of SMP*/
-	spin_lock_irqsave(&cmd_info.control_path_lock, irq_flags);
+	spin_lock_bh(&cmd_info.control_path_lock);
 
 	if (cmd_info.outstanding_ctrl_req < MAX_OUTSTANDING_CTRL_REQ) {
-		DEBUG_LOG("Sending the CMD, got Access\n");
+		UCCP_DEBUG_IF("Sending the CMD, got Access\n");
 		hal_ops.send((void *)nbuf, HOST_MOD_ID, UMAC_MOD_ID, 0);
 		dev->stats->gen_cmd_send_count++;
 	} else {
-		DEBUG_LOG("Sending the CMD, Waiting in Queue: %d\n",
+		UCCP_DEBUG_IF("Sending the CMD, Waiting in Queue: %d\n",
 			     cmd_info.outstanding_ctrl_req);
 		skb_queue_tail(&cmd_info.outstanding_cmd, nbuf);
 	}
 
 	/* sent but still no proc_done / unsent due to pending requests */
 	cmd_info.outstanding_ctrl_req++;
-	spin_unlock_irqrestore(&cmd_info.control_path_lock, irq_flags);
+	spin_unlock_bh(&cmd_info.control_path_lock);
 	rcu_read_unlock();
 
 	return 0;
@@ -571,8 +589,9 @@ int uccp420wlan_prog_reset(unsigned int reset_type, unsigned int lmac_mode)
 	reset.type = reset_type;
 
 	if (reset_type == LMAC_ENABLE) {
-		DEBUG_LOG("ed = %d auto = %d\n", dev->params->ed_sensitivity,
-			     dev->params->auto_sensitivity);
+		UCCP_DEBUG_IF("ed = %d auto = %d\n",
+			dev->params->ed_sensitivity,
+			dev->params->auto_sensitivity);
 		reset.ed_sensitivity = dev->params->ed_sensitivity;
 		reset.auto_sensitivity = dev->params->auto_sensitivity;
 		reset.include_rxmac_hdr = 0;
@@ -698,6 +717,10 @@ int uccp420wlan_proc_tx(void)
 		tx_cmd.bcc_or_ldpc = 0;
 		tx_cmd.stbc_enabled = 0;
 		tx_cmd.num_rates++;
+	} else {
+		WARN_ON(1);
+		rcu_read_unlock();
+		return -90;
 	}
 
 	nbuf = alloc_skb(sizeof(struct cmd_tx_ctrl) +
@@ -1023,6 +1046,7 @@ int uccp420wlan_prog_ba_session_data(unsigned int op,
 	int index;
 	struct mac80211_dev *dev;
 	struct lmac_if_data *p;
+	struct ieee80211_vif *vif = NULL;
 
 	rcu_read_lock();
 	p = (struct lmac_if_data *)(rcu_dereference(lmac_if));
@@ -1033,18 +1057,22 @@ int uccp420wlan_prog_ba_session_data(unsigned int op,
 		return -1;
 	}
 
-	rcu_read_unlock();
 	dev = p->context;
 
 	memset(&ba_cmd, 0, sizeof(struct cmd_ht_ba));
 
 	for (index = 0; index < dev->params->num_vifs; index++) {
-		if (dev->if_mac_addresses[index].addr[5] == vif_addr[5])
+		if (!(dev->active_vifs & (1 << index)))
+			continue;
+
+		vif = rcu_dereference(dev->vifs[index]);
+
+		if (ether_addr_equal(vif->addr, vif_addr))
 			break;
 	}
 
 	if (index == dev->params->num_vifs) {
-		DEBUG_LOG("no VIF found\n");
+		UCCP_DEBUG_IF("no VIF found\n");
 		return -1;
 	}
 
@@ -1055,6 +1083,8 @@ int uccp420wlan_prog_ba_session_data(unsigned int op,
 	ba_cmd.ssn = *ssn;
 	ether_addr_copy(ba_cmd.vif_addr, vif_addr);
 	ether_addr_copy(ba_cmd.peer_addr, peer_addr);
+
+	rcu_read_unlock();
 
 	return uccp420wlan_send_cmd((unsigned char *) &ba_cmd,
 				    sizeof(struct cmd_ht_ba),
@@ -1086,7 +1116,7 @@ int uccp420wlan_scan(int index,
 		       req->ie_len, GFP_KERNEL);
 
 	if (scan == NULL) {
-		DEBUG_LOG("%s: Failed to allocate memory\n", __func__);
+		UCCP_DEBUG_IF("%s: Failed to allocate memory\n", __func__);
 		return -ENOMEM;
 	}
 
@@ -1135,27 +1165,26 @@ int uccp420wlan_scan(int index,
 				       req->ssids[i].ssid_len);
 		}
 	}
-	DEBUG_LOG("Scan request ie\n");
-	DEBUG_LOG("	len = %d n_channel = %d, n_ssids = %d\n",
-			req->ie_len,
-			scan->n_channel,
-			scan->n_ssids);
-	DEBUG_LOG("	if_index = %d type = %d p2p = %d\n",
-			scan->if_index,
-			scan->type,
-			scan->p2p_probe);
+	UCCP_DEBUG_SCAN("Scan request ie len = %d n_channel = %d,",
+						req->ie_len,
+						scan->n_channel);
+	UCCP_DEBUG_SCAN(" n_ssids = %d, if_index = %d type = %d p2p = %d\n",
+						scan->n_ssids,
+						scan->if_index,
+						scan->type,
+						scan->p2p_probe);
 
 	for (i = 0; i < scan->n_ssids; i++) {
 		if (scan->ssids[i].len != 0)
-			DEBUG_LOG("SSID: %s\n", scan->ssids[i].ssid);
+			UCCP_DEBUG_SCAN("SSID: %s\n", scan->ssids[i].ssid);
 		else
-			DEBUG_LOG("SSID: EMPTY\n");
+			UCCP_DEBUG_SCAN("SSID: EMPTY\n");
 	}
 
-	DEBUG_LOG("CHANNEL_LIST: Channel ==> Channel Flags\n");
+	UCCP_DEBUG_SCAN("CHANNEL_LIST: Channel ==> Channel Flags\n");
 
 	for (i = 0; i < scan->n_channel; i++)
-		DEBUG_LOG("Index %d: %d ==> %d\n", i,
+		UCCP_DEBUG_SCAN("Index %d: %d ==> %d\n", i,
 				scan->channel_list[i], scan->chan_flags[i]);
 
 	dev->stats->umac_scan_req++;
@@ -1176,7 +1205,7 @@ int uccp420wlan_scan_abort(int index)
 		kmalloc(sizeof(struct cmd_scan_abort), GFP_KERNEL);
 
 	if (scan_abort == NULL) {
-		DEBUG_LOG("%s: Failed to allocate memory\n", __func__);
+		UCCP_DEBUG_IF("%s: Failed to allocate memory\n", __func__);
 		return -ENOMEM;
 	}
 
@@ -1211,6 +1240,7 @@ int uccp420wlan_prog_channel(unsigned int prim_ch,
 	int is_vht_bw80_sec_40plus;
 	int is_vht_bw80;
 	int ch_no1, ch_no2;
+	int err = 0;
 	unsigned int cf_offset = center_freq1;
 
 	memset(&channel, 0, sizeof(struct cmd_channel));
@@ -1307,9 +1337,20 @@ int uccp420wlan_prog_channel(unsigned int prim_ch,
 
 	rcu_read_unlock();
 
-	return uccp420wlan_send_cmd((unsigned char *) &channel,
-				    sizeof(struct cmd_channel),
-				    UMAC_CMD_CHANNEL);
+	dev->chan_prog_done = 0;
+
+	err = uccp420wlan_send_cmd((unsigned char *) &channel,
+				   sizeof(struct cmd_channel),
+				   UMAC_CMD_CHANNEL);
+
+
+	if (err)
+		return err;
+
+	if (wait_for_channel_prog_complete(dev))
+		return -1;
+
+	return 0;
 }
 
 
@@ -1406,11 +1447,10 @@ int uccp420wlan_prog_tx(unsigned int queue,
 	unsigned int hdrlen, pkt = 0;
 	int vif_index;
 	__u16 fc;
-	unsigned long irq_flags, tx_irq_flags;
 #ifdef MULTI_CHAN_SUPPORT
-	struct tx_pkt_info *pkt_info = NULL;
 	struct tx_config *tx;
 #endif
+	struct tx_pkt_info *pkt_info = NULL;
 
 	memset(&tx_cmd, 0, sizeof(struct cmd_tx_ctrl));
 
@@ -1424,9 +1464,9 @@ int uccp420wlan_prog_tx(unsigned int queue,
 	}
 
 	dev = p->context;
-	spin_lock_irqsave(&dev->tx.lock, tx_irq_flags);
-	tx = &dev->tx;
+	spin_lock_bh(&dev->tx.lock);
 #ifdef MULTI_CHAN_SUPPORT
+	tx = &dev->tx;
 	txq = &dev->tx.pkt_info[curr_chanctx_idx][descriptor_id].pkt;
 	pkt_info = &dev->tx.pkt_info[curr_chanctx_idx][descriptor_id];
 #else
@@ -1436,7 +1476,7 @@ int uccp420wlan_prog_tx(unsigned int queue,
 	skb_first = skb_peek(txq);
 
 	if (!skb_first) {
-		spin_unlock_irqrestore(&dev->tx.lock, tx_irq_flags);
+		spin_unlock_bh(&dev->tx.lock);
 		rcu_read_unlock();
 		return -10;
 	}
@@ -1454,22 +1494,35 @@ int uccp420wlan_prog_tx(unsigned int queue,
 	if ((ieee80211_is_data(fc) ||
 	     ieee80211_is_data_qos(fc))
 	    && ieee80211_has_protected(fc)) {
-		DEBUG_LOG("%s:cipher: %d,icv_len: %d,iv_len: %d,keylen:%d\n",
-			     __func__,
-			     tx_info_first->control.hw_key->cipher,
-			     tx_info_first->control.hw_key->icv_len,
-			     tx_info_first->control.hw_key->iv_len,
-			     tx_info_first->control.hw_key->keylen);
-
-		/* iv_len is always the header ahd
-		 * icv_len is always the trailer
-		 * include only iv_len
+		/* hw_key == NULL: Encrypted in SW (injected frames)
+		 * iv_len = 0: treat as SW encryption.
 		 */
-		hdrlen += tx_info_first->control.hw_key->iv_len;
+		if (tx_info_first->control.hw_key == NULL ||
+		    !tx_info_first->control.hw_key->iv_len) {
+			UCCP_DEBUG_IF("%s: hw_key is %s and iv_len: 0\n",
+			  __func__,
+			  tx_info_first->control.hw_key?"valid":"NULL");
+			tx_cmd.encrypt = ENCRYPT_DISABLE;
+		 } else {
+			UCCP_DEBUG_IF("%s: cipher: %d, icv: %d",
+				  __func__,
+				  tx_info_first->control.hw_key->cipher,
+				  tx_info_first->control.hw_key->icv_len);
+			UCCP_DEBUG_IF("iv: %d, key: %d\n",
+				  tx_info_first->control.hw_key->iv_len,
+				  tx_info_first->control.hw_key->keylen);
+			/* iv_len is always the header and icv_len is always
+			 * the trailer include only iv_len
+			 */
+			hdrlen += tx_info_first->control.hw_key->iv_len;
+			tx_cmd.encrypt = ENCRYPT_ENABLE;
+		}
 	}
 
+#ifdef MULTI_CHAN_SUPPORT
 	if (tx_info_first->flags & IEEE80211_TX_CTL_TX_OFFCHAN)
 		tx_cmd.tx_flags |= (1 << UMAC_TX_FLAG_OFFCHAN_FRM);
+#endif
 
 	/* For injected frames (wlantest) hw_key is not set,as PMF uses
 	 * CCMP always so hardcode this to CCMP IV LEN 8.
@@ -1478,7 +1531,7 @@ int uccp420wlan_prog_tx(unsigned int queue,
 	if (ieee80211_is_unicast_robust_mgmt_frame(skb_first) &&
 	    ieee80211_has_protected(fc)) {
 		hdrlen += 8;
-		tx_cmd.force_encrypt = 1;
+		tx_cmd.encrypt = ENCRYPT_ENABLE;
 	}
 
 	/* separate in to up to TSF and From TSF*/
@@ -1518,7 +1571,7 @@ int uccp420wlan_prog_tx(unsigned int queue,
 			 MAX_GRAM_PAYLOAD_LEN, GFP_ATOMIC);
 
 	if (!nbuf) {
-		spin_unlock_irqrestore(&dev->tx.lock, tx_irq_flags);
+		spin_unlock_bh(&dev->tx.lock);
 		rcu_read_unlock();
 		return -20;
 	}
@@ -1536,14 +1589,14 @@ int uccp420wlan_prog_tx(unsigned int queue,
 	nbuf_start = (struct sk_buff *)data;
 	memcpy(data, &tx_cmd,  sizeof(struct cmd_tx_ctrl));
 
-	DEBUG_LOG("%s-UMACTX: TX Frame, Queue = %d, descriptord_id = %d\n",
+	UCCP_DEBUG_TX("%s-UMACTX: TX Frame, Queue = %d, descriptord_id = %d\n",
 		     dev->name,
 		     tx_cmd.queue_num, tx_cmd.descriptor_id);
-	DEBUG_LOG("		num_frames= %d qlen: %d len = %d\n",
+	UCCP_DEBUG_TX("		num_frames= %d qlen: %d len = %d\n",
 		     tx_cmd.num_frames_per_desc, skb_queue_len(txq),
 		     nbuf->len);
 
-	DEBUG_LOG("%s-UMACTX: Num rates = %d, %x, %x, %x, %x\n",
+	UCCP_DEBUG_TX("%s-UMACTX: Num rates = %d, %x, %x, %x, %x\n",
 		     dev->name,
 		     tx_cmd.num_rates,
 		     tx_cmd.rate[0],
@@ -1551,7 +1604,7 @@ int uccp420wlan_prog_tx(unsigned int queue,
 		     tx_cmd.rate[2],
 		     tx_cmd.rate[3]);
 
-	DEBUG_LOG("%s-UMACTX: Retries   = %d, %d, %d, %d, %d\n",
+	UCCP_DEBUG_TX("%s-UMACTX: Retries   = %d, %d, %d, %d, %d\n",
 		  dev->name,
 		  pkt_info->max_retries,
 		  tx_cmd.rate_retries[0],
@@ -1609,7 +1662,7 @@ int uccp420wlan_prog_tx(unsigned int queue,
 		skb_pull(skb, hdrlen);
 		if (hal_ops.map_tx_buf(descriptor_id, pkt,
 				       skb->data, skb->len)) {
-			spin_unlock_irqrestore(&dev->tx.lock, tx_irq_flags);
+			spin_unlock_bh(&dev->tx.lock);
 			rcu_read_unlock();
 			dev_kfree_skb_any(nbuf);
 			return -30;
@@ -1631,14 +1684,14 @@ int uccp420wlan_prog_tx(unsigned int queue,
 		txq = &dev->tx.pkt_info[descriptor_id].pkt;
 #endif
 
-		spin_lock_irqsave(&cmd_info.control_path_lock, irq_flags);
+		spin_lock_bh(&cmd_info.control_path_lock);
 
 		hal_ops.send((void *)nbuf,
 			     HOST_MOD_ID,
 			     UMAC_MOD_ID,
 			     (void *)txq);
 
-		spin_unlock_irqrestore(&cmd_info.control_path_lock, irq_flags);
+		spin_unlock_bh(&cmd_info.control_path_lock);
 
 		/* increment tx_cmd_send_count to keep track of number of
 		 * tx_cmd send
@@ -1651,7 +1704,7 @@ int uccp420wlan_prog_tx(unsigned int queue,
 	}
 #endif
 
-	spin_unlock_irqrestore(&dev->tx.lock, tx_irq_flags);
+	spin_unlock_bh(&dev->tx.lock);
 	rcu_read_unlock();
 
 	return 0;
@@ -1668,7 +1721,7 @@ int uccp420wlan_prog_vif_short_slot(int index,
 	vif_cfg.changed_bitmap = SHORTSLOT_CHANGED;
 	vif_cfg.use_short_slot = use_short_slot;
 	vif_cfg.if_index = index;
-	memcpy(vif_cfg.vif_addr, vif_addr, 6);
+	ether_addr_copy(vif_cfg.vif_addr, vif_addr);
 
 	return uccp420wlan_send_cmd((unsigned char *)&vif_cfg,
 				    sizeof(struct cmd_vif_cfg),
@@ -1686,7 +1739,7 @@ int uccp420wlan_prog_vif_atim_window(int index,
 	vif_cfg.changed_bitmap = ATIMWINDOW_CHANGED;
 	vif_cfg.atim_window = atim_window;
 	vif_cfg.if_index = index;
-	memcpy(vif_cfg.vif_addr, vif_addr, 6);
+	ether_addr_copy(vif_cfg.vif_addr, vif_addr);
 
 	return uccp420wlan_send_cmd((unsigned char *)&vif_cfg,
 				    sizeof(struct cmd_vif_cfg),
@@ -1704,7 +1757,7 @@ int uccp420wlan_prog_long_retry(int index,
 	vif_cfg.changed_bitmap = LONGRETRY_CHANGED;
 	vif_cfg.long_retry = long_retry;
 	vif_cfg.if_index = index;
-	memcpy(vif_cfg.vif_addr, vif_addr, 6);
+	ether_addr_copy(vif_cfg.vif_addr, vif_addr);
 
 	return uccp420wlan_send_cmd((unsigned char *)&vif_cfg,
 				    sizeof(struct cmd_vif_cfg),
@@ -1724,7 +1777,7 @@ int uccp420wlan_prog_short_retry(int index,
 	vif_cfg.changed_bitmap = SHORTRETRY_CHANGED;
 	vif_cfg.short_retry = short_retry;
 	vif_cfg.if_index = index;
-	memcpy(vif_cfg.vif_addr, vif_addr, 6);
+	ether_addr_copy(vif_cfg.vif_addr, vif_addr);
 
 	return uccp420wlan_send_cmd((unsigned char *)&vif_cfg,
 				    sizeof(struct cmd_vif_cfg),
@@ -1744,7 +1797,7 @@ int uccp420wlan_prog_vif_basic_rates(int index,
 	vif_cfg.changed_bitmap = BASICRATES_CHANGED;
 	vif_cfg.basic_rate_set = basic_rate_set;
 	vif_cfg.if_index = index;
-	memcpy(vif_cfg.vif_addr, vif_addr, 6);
+	ether_addr_copy(vif_cfg.vif_addr, vif_addr);
 
 	return uccp420wlan_send_cmd((unsigned char *)&vif_cfg,
 				    sizeof(struct cmd_vif_cfg),
@@ -1764,7 +1817,7 @@ int uccp420wlan_prog_vif_aid(int index,
 	vif_cfg.changed_bitmap = AID_CHANGED;
 	vif_cfg.aid = aid;
 	vif_cfg.if_index = index;
-	memcpy(vif_cfg.vif_addr, vif_addr, 6);
+	ether_addr_copy(vif_cfg.vif_addr, vif_addr);
 
 	return uccp420wlan_send_cmd((unsigned char *)&vif_cfg,
 				    sizeof(struct cmd_vif_cfg),
@@ -1783,7 +1836,7 @@ int uccp420wlan_prog_vif_op_channel(int index,
 	vif_cfg.changed_bitmap = OP_CHAN_CHANGED;
 	vif_cfg.op_channel = op_channel;
 	vif_cfg.if_index = index;
-	memcpy(vif_cfg.vif_addr, vif_addr, 6);
+	ether_addr_copy(vif_cfg.vif_addr, vif_addr);
 
 	return uccp420wlan_send_cmd((unsigned char *)&vif_cfg,
 				    sizeof(struct cmd_vif_cfg),
@@ -1802,7 +1855,7 @@ int uccp420wlan_prog_vif_conn_state(int index,
 	vif_cfg.changed_bitmap = CONNECT_STATE_CHANGED;
 	vif_cfg.connect_state = connect_state;
 	vif_cfg.if_index = index;
-	memcpy(vif_cfg.vif_addr, vif_addr, 6);
+	ether_addr_copy(vif_cfg.vif_addr, vif_addr);
 	return uccp420wlan_send_cmd((unsigned char *)&vif_cfg,
 				    sizeof(struct cmd_vif_cfg),
 				    UMAC_CMD_VIF_CFG);
@@ -1820,7 +1873,7 @@ int uccp420wlan_prog_vif_assoc_cap(int index,
 	vif_cfg.changed_bitmap = CAPABILITY_CHANGED;
 	vif_cfg.capability = caps;
 	vif_cfg.if_index = index;
-	memcpy(vif_cfg.vif_addr, vif_addr, 6);
+	ether_addr_copy(vif_cfg.vif_addr, vif_addr);
 
 	return uccp420wlan_send_cmd((unsigned char *)&vif_cfg,
 				    sizeof(struct cmd_vif_cfg),
@@ -1840,7 +1893,7 @@ int uccp420wlan_prog_vif_beacon_int(int index,
 	vif_cfg.changed_bitmap = BCN_INT_CHANGED;
 	vif_cfg.beacon_interval = bcn_int;
 	vif_cfg.if_index = index;
-	memcpy(vif_cfg.vif_addr, vif_addr, 6);
+	ether_addr_copy(vif_cfg.vif_addr, vif_addr);
 
 	return uccp420wlan_send_cmd((unsigned char *)&vif_cfg,
 				    sizeof(struct cmd_vif_cfg),
@@ -1859,7 +1912,7 @@ int uccp420wlan_prog_vif_dtim_period(int index,
 	vif_cfg.changed_bitmap = DTIM_PERIOD_CHANGED;
 	vif_cfg.beacon_interval = dtim_period;
 	vif_cfg.if_index = index;
-	memcpy(vif_cfg.vif_addr, vif_addr, 6);
+	ether_addr_copy(vif_cfg.vif_addr, vif_addr);
 
 	return uccp420wlan_send_cmd((unsigned char *)&vif_cfg,
 				    sizeof(struct cmd_vif_cfg),
@@ -1875,8 +1928,8 @@ int uccp420wlan_prog_vif_bssid(int index,
 
 	memset(&vif_cfg, 0, sizeof(struct cmd_vif_cfg));
 	vif_cfg.changed_bitmap = BSSID_CHANGED;
-	memcpy(vif_cfg.bssid, bssid, 6);
-	memcpy(vif_cfg.vif_addr, vif_addr, 6);
+	ether_addr_copy(vif_cfg.bssid, bssid);
+	ether_addr_copy(vif_cfg.vif_addr, vif_addr);
 	vif_cfg.if_index = index;
 
 	return uccp420wlan_send_cmd((unsigned char *)&vif_cfg,
@@ -1894,7 +1947,7 @@ int uccp420wlan_prog_vif_smps(int index,
 	memset(&vif_cfg, 0, sizeof(struct cmd_vif_cfg));
 	vif_cfg.changed_bitmap = SMPS_CHANGED;
 	vif_cfg.if_index = index;
-	memcpy(vif_cfg.vif_addr, vif_addr, 6);
+	ether_addr_copy(vif_cfg.vif_addr, vif_addr);
 
 	switch (smps_mode) {
 	case IEEE80211_SMPS_STATIC:
@@ -2002,7 +2055,7 @@ int uccp420wlan_set_rate(int rate, int mcs)
 	struct cmd_rate cmd_rate;
 
 	memset(&cmd_rate, 0, (sizeof(struct cmd_rate)));
-	DEBUG_LOG("mcs = %d rate = %d\n", mcs, rate);
+	UCCP_DEBUG_IF("mcs = %d rate = %d\n", mcs, rate);
 	cmd_rate.is_mcs = mcs;
 	cmd_rate.rate = rate;
 	return uccp420wlan_send_cmd((unsigned char *) &cmd_rate,
@@ -2037,7 +2090,7 @@ int uccp420wlan_prog_aux_adc_chain(unsigned int chain_id)
 				    UMAC_CMD_AUX_ADC_CHAIN_SEL);
 }
 
-int uccp420wlan_cont_tx(int val)
+int uccp420wlan_prog_cont_tx(int val)
 {
 	struct cmd_cont_tx status;
 
@@ -2055,7 +2108,7 @@ int uccp420wlan_prog_mib_stats(void)
 {
 	struct host_mac_msg_hdr mib_stats_cmd;
 
-	DEBUG_LOG("cmd mib stats\n");
+	UCCP_DEBUG_IF("cmd mib stats\n");
 	memset(&mib_stats_cmd, 0, sizeof(struct host_mac_msg_hdr));
 
 	return uccp420wlan_send_cmd((unsigned char *)&mib_stats_cmd,
@@ -2068,7 +2121,7 @@ int uccp420wlan_prog_clear_stats(void)
 {
 	struct host_mac_msg_hdr clear_stats_cmd;
 
-	DEBUG_LOG("cmd clear stats\n");
+	UCCP_DEBUG_IF("cmd clear stats\n");
 	memset(&clear_stats_cmd, 0, sizeof(struct host_mac_msg_hdr));
 
 	return uccp420wlan_send_cmd((unsigned char *)&clear_stats_cmd,
@@ -2081,12 +2134,25 @@ int uccp420wlan_prog_phy_stats(void)
 {
 	struct host_mac_msg_hdr phy_stats_cmd;
 
-	DEBUG_LOG("cmd phy stats\n");
+	UCCP_DEBUG_IF("cmd phy stats\n");
 	memset(&phy_stats_cmd, 0, sizeof(struct host_mac_msg_hdr));
 
 	return uccp420wlan_send_cmd((unsigned char *)&phy_stats_cmd,
 				    sizeof(struct host_mac_msg_hdr),
 				    UMAC_CMD_PHY_STATS);
+}
+
+
+int uccp420wlan_prog_radar_detect(unsigned int op_code)
+{
+	struct cmd_detect_radar dfs_op;
+
+	UCCP_DEBUG_IF("cmd radar detect\n");
+	dfs_op.radar_detect_op = op_code;
+
+	return uccp420wlan_send_cmd((unsigned char *) &dfs_op,
+				    sizeof(struct cmd_detect_radar),
+				    UMAC_CMD_DETECT_RADAR);
 }
 
 
@@ -2127,7 +2193,6 @@ int uccp420wlan_msg_handler(void *nbuff,
 	struct lmac_if_data *p;
 	struct sk_buff *skb = (struct sk_buff *)nbuff;
 	struct sk_buff *pending_cmd;
-	unsigned long irq_flags;
 	struct mac80211_dev *dev;
 #ifdef MULTI_CHAN_SUPPORT
 	int curr_chanctx_idx = -1;
@@ -2151,13 +2216,13 @@ int uccp420wlan_msg_handler(void *nbuff,
 
 	dev = (struct mac80211_dev *)p->context;
 
-	/* DEBUG_LOG("%s-UMACIF: event %d received\n", p->name, event); */
+	/* UCCP_DEBUG_IF("%s-UMACIF: event %d received\n", p->name, event); */
 	if (event == UMAC_EVENT_RESET_COMPLETE) {
 		struct host_event_reset_complete *r =
 				(struct host_event_reset_complete *)buff;
 
 		uccp420wlan_reset_complete(r->version, p->context);
-		spin_lock_irqsave(&cmd_info.control_path_lock, irq_flags);
+		spin_lock_bh(&cmd_info.control_path_lock);
 
 		if (cmd_info.outstanding_ctrl_req == 0) {
 			pr_err("%s-UMACIF: Unexpected: Spurious proc_done received. Ignoring and continuing.\n",
@@ -2165,19 +2230,19 @@ int uccp420wlan_msg_handler(void *nbuff,
 		} else {
 			cmd_info.outstanding_ctrl_req--;
 
-			DEBUG_LOG("After DEC: outstanding cmd: %d\n",
+			UCCP_DEBUG_IF("After DEC: outstanding cmd: %d\n",
 				     cmd_info.outstanding_ctrl_req);
 			pending_cmd = skb_dequeue(&cmd_info.outstanding_cmd);
 
 			if (unlikely(pending_cmd != NULL)) {
-				DEBUG_LOG("Send 1 outstanding cmd\n");
+				UCCP_DEBUG_IF("Send 1 outstanding cmd\n");
 				hal_ops.send((void *)pending_cmd, HOST_MOD_ID,
 					     UMAC_MOD_ID, 0);
 				dev->stats->gen_cmd_send_count++;
 			}
 		}
 
-		spin_unlock_irqrestore(&cmd_info.control_path_lock, irq_flags);
+		spin_unlock_bh(&cmd_info.control_path_lock);
 	} else if (event == UMAC_EVENT_SCAN_ABORT_COMPLETE) {
 		dev->scan_abort_done = 1;
 #ifdef CONFIG_PM
@@ -2186,6 +2251,7 @@ int uccp420wlan_msg_handler(void *nbuff,
 				(struct umac_event_ps_econ_cfg_complete *)buff;
 		dev->econ_ps_cfg_stats.completed = 1;
 		dev->econ_ps_cfg_stats.result = econ_cfg_complete_data->status;
+		rx_interrupt_status = 0;
 	} else if (event == UMAC_EVENT_PS_ECON_WAKE) {
 		struct umac_event_ps_econ_wake *econ_wake_data =
 					(struct umac_event_ps_econ_wake *)buff;
@@ -2230,27 +2296,27 @@ int uccp420wlan_msg_handler(void *nbuff,
 		}
 
 		cmd_info.tx_done_recv_count++;
-
 	} else if (event == UMAC_EVENT_DISCONNECTED) {
 		struct host_event_disconnect *dis =
 			(struct host_event_disconnect *)buff;
+		struct mac80211_dev *dev = (struct mac80211_dev *)p->context;
+		struct ieee80211_vif *vif = NULL;
 		int i = 0;
 
 		if (dis->reason_code == REASON_NW_LOST) {
-			while (i < MAX_VIFS) {
-				if (dev->vifs[i]) {
-					if ((memcmp(dev->vifs[i]->addr,
-						    dis->mac_addr,
-						    ETH_ALEN)) == 0) {
-						ieee80211_connection_loss(
-								dev->vifs[i]);
-						break;
-					}
+			for (i = 0; i < MAX_VIFS; i++) {
+				if (!(dev->active_vifs & (1 << i)))
+					continue;
+
+				vif = rcu_dereference(dev->vifs[i]);
+
+				if (ether_addr_equal(vif->addr,
+						     dis->mac_addr)) {
+					ieee80211_connection_loss(vif);
+					break;
 				}
-				i++;
 			}
 		}
-
 	} else if (event == UMAC_EVENT_MIB_STAT) {
 		struct umac_event_mib_stats  *mib_stats =
 			(struct umac_event_mib_stats *) buff;
@@ -2262,20 +2328,18 @@ int uccp420wlan_msg_handler(void *nbuff,
 
 		uccp420wlan_mac_stats(mac_stats, p->context);
 	} else if (event == UMAC_EVENT_NW_FOUND) {
-		DEBUG_LOG("received event_found\n");
+		UCCP_DEBUG_IF("received event_found\n");
 	} else if (event == UMAC_EVENT_PHY_STAT) {
 		int i;
-#ifdef DRIVER_DEBUG
 		struct host_event_phy_stats *phy =
 			(struct host_event_phy_stats *)buff;
-#endif
-		DEBUG_LOG("received phy stats event\n");
-		DEBUG_LOG("phy stats are\n");
+		UCCP_DEBUG_IF("received phy stats event\n");
+		UCCP_DEBUG_IF("phy stats are\n");
 
 		for (i = 0; i < 32; i++)
-			DEBUG_LOG("%x ", phy->phy_stats[i]);
+			UCCP_DEBUG_IF("%x ", phy->phy_stats[i]);
 
-		DEBUG_LOG("\n\n\n");
+		UCCP_DEBUG_IF("\n\n\n");
 	} else if (event == UMAC_EVENT_NOA) {
 		uccp420wlan_noa_event(FROM_EVENT_NOA, (void *)buff,
 				      p->context, NULL);
@@ -2284,9 +2348,9 @@ int uccp420wlan_msg_handler(void *nbuff,
 		/*struct host_event_command_complete *cmd =
 		 * (struct host_event_command_complete*)buff;
 		 */
-		DEBUG_LOG("Received  PROC_DONE\n");
+		UCCP_DEBUG_IF("Received  PROC_DONE\n");
 
-		spin_lock_irqsave(&cmd_info.control_path_lock, irq_flags);
+		spin_lock_bh(&cmd_info.control_path_lock);
 
 		if (cmd_info.outstanding_ctrl_req == 0) {
 			pr_err("%s-UMACIF: Unexpected: Spurious proc_done received. Ignoring and continuing\n",
@@ -2294,23 +2358,25 @@ int uccp420wlan_msg_handler(void *nbuff,
 		} else {
 			cmd_info.outstanding_ctrl_req--;
 
-			DEBUG_LOG("After DEC: outstanding cmd: %d\n",
+			UCCP_DEBUG_IF("After DEC: outstanding cmd: %d\n",
 				     cmd_info.outstanding_ctrl_req);
 
 			pending_cmd = skb_dequeue(&cmd_info.outstanding_cmd);
 
 			if (unlikely(pending_cmd != NULL)) {
-				DEBUG_LOG("Send 1 outstanding cmd\n");
+				UCCP_DEBUG_IF("Send 1 outstanding cmd\n");
 				hal_ops.send((void *)pending_cmd, HOST_MOD_ID,
 					     UMAC_MOD_ID, 0);
 				dev->stats->gen_cmd_send_count++;
 			}
 		}
-		spin_unlock_irqrestore(&cmd_info.control_path_lock, irq_flags);
+		spin_unlock_bh(&cmd_info.control_path_lock);
 
 	} else if (event == UMAC_EVENT_CH_PROG_DONE) {
 		uccp420wlan_ch_prog_complete(event,
 			(struct umac_event_ch_prog_complete *)buff, p->context);
+	} else if (event == UMAC_EVENT_RADAR_DETECTED) {
+		ieee80211_radar_detected(dev->hw);
 	} else if (event == UMAC_EVENT_RF_CALIB_DATA) {
 		struct umac_event_rf_calib_data  *rf_data = (void *)buff;
 
@@ -2319,16 +2385,15 @@ int uccp420wlan_msg_handler(void *nbuff,
 		struct umac_event_roc_status *roc_status = (void *)buff;
 		struct delayed_work *work = NULL;
 
-		DEBUG_LOG("%s-UMACIF: ROC status is %d\n",
-			  dev->name,
-			  roc_status->roc_status);
+		UCCP_DEBUG_ROC("%s:%d ROC status is %d\n",
+			__func__, __LINE__, roc_status->roc_status);
 
 		switch (roc_status->roc_status) {
 		case UMAC_ROC_STAT_STARTED:
 			if (dev->roc_params.roc_in_progress == 0) {
 				dev->roc_params.roc_in_progress = 1;
 				ieee80211_ready_on_channel(dev->hw);
-				DEBUG_LOG("%s-UMACIF: ROC READY..\n",
+				UCCP_DEBUG_ROC("%s-UMACIF: ROC READY..\n",
 					  dev->name);
 			}
 			break;
@@ -2348,6 +2413,8 @@ int uccp420wlan_msg_handler(void *nbuff,
 					     p->context);
 
 #endif
+	} else if (event == UMAC_EVENT_FW_ERROR) {
+		pr_err("%s: FW is in Error State, please reload.\n", __func__);
 	} else {
 		pr_warn("%s: Unknown event received %d\n", __func__, event);
 	}
@@ -2365,7 +2432,7 @@ int uccp420wlan_lmac_if_init(void *context, const char *name)
 {
 	struct lmac_if_data *p;
 
-	DEBUG_LOG("%s-UMACIF: lmac_if init called\n", name);
+	UCCP_DEBUG_IF("%s-UMACIF: lmac_if init called\n", name);
 
 	p = kzalloc(sizeof(struct lmac_if_data), GFP_KERNEL);
 
@@ -2388,7 +2455,7 @@ void uccp420wlan_lmac_if_deinit(void)
 {
 	struct lmac_if_data *p;
 
-	DEBUG_LOG("%s-UMACIF: Deinit called\n", lmac_if->name);
+	UCCP_DEBUG_IF("%s-UMACIF: Deinit called\n", lmac_if->name);
 
 	p = rcu_dereference(lmac_if);
 	rcu_assign_pointer(lmac_if, NULL);

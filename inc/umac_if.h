@@ -186,7 +186,7 @@ extern int uccp420wlan_prog_mcast_filter_control(unsigned int
 
 extern int uccp420wlan_prog_rcv_bcn_mode(unsigned int  bcn_rcv_mode);
 extern int uccp420wlan_prog_aux_adc_chain(unsigned int chain_id);
-extern int uccp420wlan_cont_tx(int val);
+extern int uccp420wlan_prog_cont_tx(int val);
 extern int uccp420wlan_prog_txq_params(int index,
 				       unsigned char *vif_addr,
 				       unsigned int queue,
@@ -240,6 +240,8 @@ extern int uccp420wlan_prog_roc(unsigned int roc_status,
 				unsigned int roc_channel,
 				unsigned int roc_duration,
 				unsigned int roc_type);
+
+extern int uccp420wlan_prog_radar_detect(unsigned int op_code);
 
 #ifdef CONFIG_PM
 extern int uccp420wlan_prog_econ_ps_state(int if_index,

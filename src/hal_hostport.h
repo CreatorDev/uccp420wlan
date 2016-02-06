@@ -70,20 +70,20 @@ struct hal_priv {
 	/* UCCP and GRAM mappings */
 	unsigned long uccp_mem_addr;
 	unsigned long gram_mem_addr;
-	unsigned long uccp_base_addr;
-	unsigned long uccp_slave_base_addr;
+	unsigned long uccp_sysbus_base_addr;
+	unsigned long uccp_perip_base_addr;
 	unsigned long gram_base_addr;
 	unsigned long shm_offset;
 	unsigned long hal_disabled;
 	unsigned long gram_b4_addr;
 
 	/* DTS entries */
-	unsigned long uccp_core_base;		/* HAL_HOST_UCCP_BASE */
-	unsigned long uccp_core_len;		/* HAL_HOST_UCCP_LEN */
-	unsigned long uccp_slave_base;		/* HAL_HOST_SLAVE_PORT_BASE */
-	unsigned long uccp_slave_len;		/* HAL_HOST_SLAVE_PORT_LEN */
-	unsigned long uccp_pkd_gram_base;	/* HAL_HOST_GRAM_BASE */
-	unsigned long uccp_pkd_gram_len;	/* HAL_GRAM_LEN */
+	unsigned long uccp_sysbus_base;
+	unsigned long uccp_sysbus_len;		/* HAL_HOST_UCCP_LEN */
+	unsigned long uccp_perip_base;		/* HAL_PERIP_BASE */
+	unsigned long uccp_perip_len;		/* HOST_PERIP_BASE_LEN */
+	unsigned long uccp_pkd_gram_base;
+	unsigned long uccp_pkd_gram_len;
 	unsigned long uccp_gram_base;		/* b4addr */
 	unsigned long uccp_gram_len;		/* b4addr length */
 
@@ -97,6 +97,7 @@ struct hal_priv {
 	/* RX */
 	struct sk_buff_head rxq;
 	struct tasklet_struct rx_tasklet;
+	struct tasklet_struct recv_tasklet;
 	unsigned short event_cnt;
 	msg_handler rcv_handler;
 	struct buf_info *rx_buf_info;
@@ -110,6 +111,9 @@ struct hal_priv {
 	/* Temp storage to refill first and process next*/
 	struct sk_buff_head refillq;
 	int irq;
+	/* physical address mapping for address */
+	unsigned long           wifi_t0_addr;
+	unsigned long           wifi_t1_addr;
 };
 
 struct hal_hdr {
@@ -148,17 +152,10 @@ struct event_hal {
 } _PACKED_;
 
 
-int _uccp420wlan_80211if_init(void);
+int _uccp420wlan_80211if_init(struct proc_dir_entry **);
 void _uccp420wlan_80211if_exit(void);
 
 /*Porting information:
- *
- * HAL_HOST_UCCP_BASE: This is physical address as in the host memory map
- *		       corresponding to the UCCP register region starting
- *		       from  0x02000000
- * HAL_HOST_GRAM_BASE: This is physical address as in the host memory map
- *                     corresponding to the UCCP GRAM region starting from
- *                     0xB7000000
  * HAL_UCCP_IRQ_LINE: This is the interrupt number assigned to UCCP host port
  *                    interrupt.
  * HAL_HOST_UCCP_RAM_START: This is the physical address of the start of
@@ -174,15 +171,10 @@ void _uccp420wlan_80211if_exit(void);
  * and  HAL_EVENT_OFFSET can be changed by IMG in future software releases.
  */
 
-#define HAL_HOST_UCCP_BASE 0x18480000
-#define HAL_HOST_GRAM_BASE 0x1A000000
 #define HAL_HOST_UCCP_LEN 0x0003E800
-#define HAL_GRAM_LEN 0x00066CC0
 #define HAL_UCCP_GRAM_BASE 0xB7000000
 
 #define HAL_UCCP_CORE_REG_OFFSET		0x400
-#define HAL_UCCP_SLAVE_PORT_OFFSET              0x3C000
-
 
 /* Register HOST_TO_UCCP_CORE_CMD */
 #define HOST_TO_UCCP_CORE_CMD 0x0030
@@ -235,14 +227,42 @@ void _uccp420wlan_80211if_exit(void);
 #define HAL_GRAM_TX_DATA_OFFSET	(HAL_GRAM_TX_DATA_START + 3)
 #define HAL_GRAM_TX_DATA_ADDR (HAL_GRAM_TX_DATA_START + 6)
 
-#define HAL_HOST_UCCP_RAM_LEN (4 * 1024 * 1024)
+#define HAL_HOST_BOUNCE_BUF_LEN (4 * 1024 * 1024)
+#define HAL_HOST_NON_BOUNCE_BUF_LEN (60 * 1024 * 1024)
+
+/* Shift the amount of movement of each the offset */
+
+/* 32bit - valid offset 8bit  - start pos 0bit*/
+#define WLN_CGN_HOST_SYS_ADDR_SHIFT    (24)
 
 #define HAL_HOST_ZONE_DMA_START 0xABABABAB
 #define HAL_HOST_ZONE_DMA_LEN (64 * 1024 * 1024)
 
+/*RPU DUMP Regions and Commands*/
+#define UCCP_REGION_TYPE_COREA 0
+#define UCCP_REGION_TYPE_COREB 1
+
+/* fwldr.c converts these to HOST addresses
+ * so pass RPU addresses here.
+ * From: uccrunTime/Platform/configs
+ */
+#define UCCP_COREA_REGION_START 0x80880000
+#define UCCP_COREA_REGION_LEN 0x4C000
+
+#define UCCP_COREB_REGION_START 0x82000000
+#define UCCP_COREB_REGION_LEN 0x4C000
+
 /* Interrupt number assigned to UCCP host port interrupt */
 #define HAL_IRQ_LINE 74
 
+enum hal_rpu_testmode_cmd {
+	HAL_RPU_TM_CMD_ALL	= 0,
+	HAL_RPU_TM_CMD_GRAM	= 1,
+	HAL_RPU_TM_CMD_COREA	= 2,
+	HAL_RPU_TM_CMD_COREB	= 3,
+	HAL_RPU_TM_CMD_PERIP	= 4,
+	HAL_RPU_TM_CMD_SYSBUS	= 5,
+};
 
 int reset_hal_params(void);
 

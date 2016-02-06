@@ -205,15 +205,27 @@ struct umac_event_mib_stats {
 	unsigned int sifs_no_resp_cnt;
 	unsigned int unsupported_cnt;
 	unsigned int l1_corr_fail_cnt;
-	unsigned int phy_stats_reserved22;
-	unsigned int phy_stats_reserved23;
-	unsigned int phy_stats_reserved24;
-	unsigned int phy_stats_reserved25;
-	unsigned int phy_stats_reserved26;
-	unsigned int phy_stats_reserved27;
-	unsigned int phy_stats_reserved28;
-	unsigned int phy_stats_reserved29;
-	unsigned int phy_stats_reserved30;
+	unsigned int sifs_crc_exit_cnt;
+	unsigned int low_energy_event_cnt;
+	unsigned int deagg_error_cnt;
+	unsigned int nsymbols_error_cnt;
+	unsigned int mcs32_cnt;
+	unsigned int ndpa_cnt;
+	unsigned int lsig_duration_error_cnt;
+	unsigned int rts_cnt;
+	unsigned int non_ht_cts_cnt;
+	unsigned int rxp_active_exit_cnt;
+	unsigned int beamform_feedback_cnt;
+	unsigned int self_cts_cnt;
+	unsigned int pop_master_cnt;
+	unsigned int pop_error_cnt;
+	unsigned int multicast_cnt;
+	unsigned int tx_ed_abort_cnt;
+	unsigned int mcp_cts_cnt;
+	unsigned int deagg_q_post_cnt;
+	unsigned int rxp_active_exit_dsss_cnt;
+	unsigned int rxp_extreme_error_cnt;
+	unsigned int aci_fail_cnt;
 	/*Tx Stats*/
 	unsigned int tx_pkts_from_lmac;
 	unsigned int tx_pkts_tx2tx;
@@ -435,6 +447,7 @@ enum UMAC_EVENT_TAG {
 #ifdef MULTI_CHAN_SUPPORT
 	UMAC_EVENT_CHAN_SWITCH,
 #endif
+	UMAC_EVENT_FW_ERROR,
 };
 
 enum CONNECT_RESULT_TAG {
@@ -511,7 +524,10 @@ struct cmd_tx_ctrl {
 #define AMPDU_AGGR_DISABLED 0x00000000
 	unsigned char aggregate_mpdu;
 
-	unsigned char force_encrypt;
+#define ENCRYPT_DISABLE 0
+#define ENCRYPT_ENABLE 1
+	unsigned char encrypt;
+
 
 #define MAC_HDR_SIZE 52
 	unsigned int pkt_gram_payload_len;

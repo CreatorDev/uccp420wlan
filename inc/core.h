@@ -48,7 +48,64 @@
 
 extern unsigned int vht_support;
 extern struct cmd_send_recv_cnt cmd_info;
+extern int uccp_debug;
 
+#ifdef CONFIG_PM
+extern unsigned char img_suspend_status;
+extern unsigned char rx_interrupt_status;
+#endif
+
+
+#define UCCP_DEBUG_TX(fmt, ...)				    \
+do {                                                                    \
+		if (uccp_debug & UCCP_DEBUG_TX)		                \
+			pr_debug(fmt, ##__VA_ARGS__);  \
+} while (0)
+
+#define UCCP_DEBUG_SCAN(fmt, ...)                           \
+do {                                                                    \
+		if (uccp_debug & UCCP_DEBUG_SCAN)                       \
+			pr_debug(fmt, ##__VA_ARGS__);  \
+} while (0)
+
+#define UCCP_DEBUG_ROC(fmt, ...)                           \
+do {                                                                    \
+		if (uccp_debug & UCCP_DEBUG_ROC)			\
+			pr_debug(fmt, ##__VA_ARGS__);  \
+} while (0)
+
+#define UCCP_DEBUG_TSMC(fmt, ...)                           \
+do {                                                                    \
+		if (uccp_debug & UCCP_DEBUG_TSMC)                       \
+			pr_debug(fmt, ##__VA_ARGS__);  \
+} while (0)
+
+#ifdef CONFIG_NL80211_TESTMODE
+#define MAX_NL_DUMP_LEN (PAGE_SIZE-1024)
+/* This section contains example code for using netlink
+ * attributes with the testmode command in nl80211.
+ */
+
+/* These enums need to be kept in sync with userspace */
+enum rpu_testmode_attr {
+	__RPU_TM_ATTR_INVALID = 0,
+	RPU_TM_ATTR_CMD      = 1,
+	RPU_TM_ATTR_DUMP      = 2,
+	/* keep last */
+	__RPU_TM_ATTR_AFTER_LAST,
+	RPU_TM_ATTR_MAX       = __RPU_TM_ATTR_AFTER_LAST - 1
+};
+
+enum rpu_testmode_cmd {
+	RPU_TM_CMD_ALL	= 0,
+	RPU_TM_CMD_GRAM  = 1,
+	RPU_TM_CMD_COREA  = 2,
+	RPU_TM_CMD_COREB  = 3,
+	RPU_TM_CMD_PERIP = 4,
+	RPU_TM_CMD_SYSBUS = 5,
+};
+
+#endif
 extern unsigned int system_rev;
 
 #ifdef PERF_PROFILING
@@ -107,6 +164,7 @@ extern spinlock_t tsf_lock;
 #define MAX_RX_STREAMS 2 /* Maximum number of RX streams supported */
 
 #define   MAX_RSSI_SAMPLES 10
+#define   UCCP_DBG_DEFAULT		0
 
 #define CLOCK_MASK 0x3FFFFFFF
 #define TICK_NUMRATOR 12288 /* 12288 KHz  */
@@ -125,6 +183,21 @@ enum noa_triggers {
 enum uccp420_hw_scan_status {
 	HW_SCAN_STATUS_NONE,
 	HW_SCAN_STATUS_PROGRESS
+};
+
+enum uccp_debug {
+	UCCP_DEBUG_SCAN			= BIT(0),
+	UCCP_DEBUG_ROC			= BIT(1),
+	UCCP_DEBUG_TX			= BIT(2),
+	UCCP_DEBUG_CORE			= BIT(3),
+	UCCP_DEBUG_IF			= BIT(4),
+	UCCP_DEBUG_80211IF		= BIT(5),
+	UCCP_DEBUG_RX			= BIT(6),
+	UCCP_DEBUG_HAL			= BIT(7),
+	UCCP_DEBUG_CRYPTO		= BIT(8),
+	UCCP_DEBUG_DUMP_RX		= BIT(9),
+	UCCP_DEBUG_DUMP_HAL		= BIT(10),
+	UCCP_DEBUG_TSMC			= BIT(11),
 };
 
 struct wifi_sync {
@@ -200,6 +273,7 @@ struct wifi_params {
 	unsigned int bt_state;
 	unsigned int antenna_sel;
 	int pkt_gen_val;
+	int init_pkt_gen;
 	int payload_length;
 	int start_prod_mode;
 	int init_prod;
@@ -295,17 +369,28 @@ struct wifi_stats {
 	unsigned int sifs_no_resp_cnt;
 	unsigned int unsupported_cnt;
 	unsigned int l1_corr_fail_cnt;
-	unsigned int phy_stats_reserved22;
-	unsigned int phy_stats_reserved23;
-	unsigned int phy_stats_reserved24;
-	unsigned int phy_stats_reserved25;
-	unsigned int phy_stats_reserved26;
-	unsigned int phy_stats_reserved27;
-	unsigned int phy_stats_reserved28;
-	unsigned int phy_stats_reserved29;
-	unsigned int phy_stats_reserved30;
-	unsigned int pdout_val;
-	unsigned char uccp420_lmac_version[8];
+	unsigned int sifs_crc_exit_cnt;
+	unsigned int low_energy_event_cnt;
+	unsigned int deagg_error_cnt;
+	unsigned int nsymbols_error_cnt;
+	unsigned int mcs32_cnt;
+	unsigned int ndpa_cnt;
+	unsigned int lsig_duration_error_cnt;
+	unsigned int rts_cnt;
+	unsigned int non_ht_cts_cnt;
+	unsigned int rxp_active_exit_cnt;
+	unsigned int beamform_feedback_cnt;
+	unsigned int self_cts_cnt;
+	unsigned int pop_master_cnt;
+	unsigned int pop_error_cnt;
+	unsigned int multicast_cnt;
+	unsigned int tx_ed_abort_cnt;
+	unsigned int mcp_cts_cnt;
+	unsigned int deagg_q_post_cnt;
+	unsigned int rxp_active_exit_dsss_cnt;
+	unsigned int rxp_extreme_error_cnt;
+	unsigned int aci_fail_cnt;
+
 	/* TX related */
 	unsigned int tx_pkts_from_lmac;
 	unsigned int tx_pkts_tx2tx;
@@ -388,6 +473,8 @@ struct wifi_stats {
 	/*RF Calibration Data*/
 	unsigned int rf_calib_data_length;
 	unsigned char rf_calib_data[MAX_RF_CALIB_DATA];
+	unsigned int pdout_val;
+	unsigned char uccp420_lmac_version[8];
 };
 
 
@@ -419,9 +506,14 @@ struct tx_config {
 	unsigned int next_spare_token_ac;
 
 	/* Used to store the address of pending skbs per ac */
+#ifdef MULTI_CHAN_SUPPORT
 	struct sk_buff_head pending_pkt[MAX_UMAC_VIF_CHANCTX_TYPES]
 				       [MAX_PEND_Q_PER_AC]
 				       [NUM_ACS];
+#else
+	struct sk_buff_head pending_pkt[MAX_PEND_Q_PER_AC]
+				       [NUM_ACS];
+#endif
 
 #ifdef MULTI_CHAN_SUPPORT
 	/* Peer which has the opportunity to xmit next on a queue */
@@ -689,15 +781,81 @@ int tx_queue_unmap(int queue);
 extern unsigned char *rf_params_vpd;
 extern int num_streams_vpd;
 
+static __always_inline long param_get_val(unsigned char *buf,
+			  unsigned char *str,
+			  unsigned long *val)
+{
+	unsigned char *temp;
+
+	if (strstr(buf, str)) {
+		temp = strstr(buf, "=") + 1;
+		/*To handle the fixed rate 5.5Mbps case*/
+		if (!strncmp(temp, "5.5", 3)) {
+			*val = 55;
+			return 1;
+		} else if (!kstrtoul(temp, 0, val)) {
+			return 1;
+		} else {
+			return 0;
+		}
+	} else {
+		return 0;
+	}
+}
+
+static __always_inline long param_get_sval(unsigned char *buf,
+			   unsigned char *str,
+			   long *val)
+{
+
+	unsigned char *temp;
+
+	if (strstr(buf, str)) {
+		temp = strstr(buf, "=") + 1;
+		/*To handle the fixed rate 5.5Mbps case*/
+		if (!strncmp(temp, "5.5", 3)) {
+			*val = 55;
+			return 1;
+		} else if (!kstrtol(temp, 0, val)) {
+			return 1;
+		} else {
+			return 0;
+		}
+	} else {
+		return 0;
+	}
+
+}
+
+static __always_inline long param_get_match(unsigned char *buf,
+				unsigned char *str)
+{
+
+	if (strstr(buf, str))
+		return 1;
+	else
+		return 0;
+}
+
 static inline int vif_addr_to_index(unsigned char *addr,
 				    struct mac80211_dev *dev)
 {
 	int i;
+	struct ieee80211_vif *vif = NULL;
 
-	for (i = 0; i < MAX_VIFS; i++)
-		if (ether_addr_equal(addr, dev->if_mac_addresses[i].addr))
+	for (i = 0; i < MAX_VIFS; i++) {
+		if (!((i < MAX_VIFS) && (dev->active_vifs & (1 << i))))
+			continue;
+
+		rcu_read_lock();
+		vif = rcu_dereference(dev->vifs[i]);
+		rcu_read_unlock();
+
+		if (ether_addr_equal(addr, vif->addr))
 			break;
-	if ((i < MAX_VIFS) && (dev->active_vifs & (1 << i)))
+	}
+
+	if (i < dev->params->num_vifs)
 		return i;
 	else
 		return -1;

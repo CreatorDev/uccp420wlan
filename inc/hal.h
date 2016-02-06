@@ -37,8 +37,8 @@ typedef int (*msg_handler)(void *, unsigned char);
 struct hal_ops_tag {
 	int (*init)(void *);
 	int (*deinit)(void *);
-	int (*start)(struct proc_dir_entry *);
-	int (*stop)(struct proc_dir_entry *);
+	int (*start)(void);
+	int (*stop)(void);
 	void (*register_callback)(msg_handler, unsigned char);
 	void (*send)(void*, unsigned char, unsigned char, void*);
 	int (*init_bufs)(unsigned int, unsigned int, unsigned int,
@@ -48,8 +48,17 @@ struct hal_ops_tag {
 	int (*unmap_tx_buf)(int, int);
 	int (*reset_hal_params)(void);
 	void (*set_mem_region)(unsigned int);
-	void (*request_mem_regions)(unsigned char **, unsigned char **,
+	void (*request_mem_regions)(unsigned char **,
+				    unsigned char **,
 				    unsigned char **);
+	void (*enable_irq_wake)(void);
+	void (*disable_irq_wake)(void);
+	int (*get_dump_gram)(long *dump_start);
+	int (*get_dump_core)(unsigned long *dump_start,
+			     unsigned char region_type);
+	int (*get_dump_perip)(unsigned long *dump_start);
+	int (*get_dump_sysbus)(unsigned long *dump_start);
+	int (*get_dump_len)(unsigned long);
 };
 
 extern struct hal_ops_tag hal_ops;

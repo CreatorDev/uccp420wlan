@@ -52,7 +52,8 @@
 #define FWLDR_PLRCRD_TRAIL_BYTES 8
 #define FWLDR_PLRCRD_DATA_BYTES (FWLDR_PLRCRD_BYTES - FWLDR_PLRCRD_TRAIL_BYTES)
 
-
+#define FW_LDR 0
+#define RPU_DUMP 1
 /******************************************************************************
 * These constants are used to access various fields within an L1 record as well
 * as other constants that are used.
@@ -151,7 +152,6 @@
 
 #define UCCP_GRAM_BASE	    0xB7000000
 
-#define UCCP_SLAVE_PORT_OFFSET 0x3C000
 #define UCCP_OFFSET_MASK    0x00FFFFFF
 #define UCCP_BASE_MASK      0xFF000000
 #define UCCP_SYSBUS_REG     0x02
@@ -314,11 +314,20 @@ struct fwldr_memhdr_tag {
 
 struct fwload_priv {
 	unsigned char           *gram_addr;
-	unsigned char           *core_addr;
+	unsigned char           *sysbus_addr;
 	unsigned char           *gram_b4_addr;
 };
 
+int rpudump_init(void);
 int fwldr_load_fw(const unsigned char *fw_data, int i);
+
+void dir_mem_read(unsigned int addr,
+			 unsigned int *data,
+			 unsigned int len);
+
+void core_mem_read(unsigned int addr,
+			  unsigned int *data,
+			  unsigned int len);
 
 static inline void fwload_uccp_read(struct fwload_priv *fpriv,
 				    unsigned long base,
@@ -326,12 +335,11 @@ static inline void fwload_uccp_read(struct fwload_priv *fpriv,
 				    unsigned int *data)
 {
 	if (base == UCCP_SYSBUS_REG)
-		*data = readl((void __iomem *)fpriv->core_addr +
-			  (offset - UCCP_SLAVE_PORT_OFFSET));
+		*data = readl((void __iomem *)(fpriv->sysbus_addr + offset));
 	else if (base == UCCP_GRAM_PACKED)
-		*data = readl((void __iomem *)fpriv->gram_addr + (offset));
+		*data = readl((void __iomem *)(fpriv->gram_addr + offset));
 	else if (base == UCCP_GRAM_MSB)
-		*data = readl((void __iomem *)fpriv->gram_b4_addr + (offset));
+		*data = readl((void __iomem *)(fpriv->gram_b4_addr + offset));
 }
 
 static inline void fwload_uccp_write(struct fwload_priv *fpriv,
@@ -340,12 +348,11 @@ static inline void fwload_uccp_write(struct fwload_priv *fpriv,
 				     unsigned int data)
 {
 	if (base == UCCP_SYSBUS_REG)
-		writel(data, (void __iomem *)(fpriv->core_addr +
-					  (offset - UCCP_SLAVE_PORT_OFFSET)));
+		writel(data, (void __iomem *)(fpriv->sysbus_addr + offset));
 	else if (base == UCCP_GRAM_PACKED)
-		writel(data, (void __iomem *)(fpriv->gram_addr + (offset)));
+		writel(data, (void __iomem *)(fpriv->gram_addr + offset));
 	else if (base == UCCP_GRAM_MSB)
-		writel(data, (void __iomem *)(fpriv->gram_b4_addr + (offset)));
+		writel(data, (void __iomem *)(fpriv->gram_b4_addr + offset));
 }
 
 #endif /* _FWLDR_H_ */
