@@ -2966,6 +2966,8 @@ static int proc_read_config(struct seq_file *m, void *v)
 		   wifi->params.num_spatial_streams);
 	seq_printf(m, "uccp_num_spatial_streams (UCCP Init) = %d\n",
 		   wifi->params.uccp_num_spatial_streams);
+	seq_printf(m, "enable_early_agg_checks = %d\n",
+		   wifi->params.enable_early_agg_checks);
 	seq_printf(m, "antenna_sel (UCCP Init) = %d\n",
 		   wifi->params.antenna_sel);
 	seq_printf(m, "max_data_size = %d (%dK)\n",
@@ -3446,6 +3448,12 @@ static int proc_read_mac_stats(struct seq_file *m, void *v)
 		   wifi->stats.tx_cmds_from_stack);
 	seq_printf(m, "tx_dones_to_stack= %d\n",
 		   wifi->stats.tx_dones_to_stack);
+	seq_printf(m, "tx_noagg_not_addr= %d\n",
+		   wifi->stats.tx_noagg_not_addr);
+	seq_printf(m, "tx_noagg_not_ampdu= %d\n",
+		   wifi->stats.tx_noagg_not_ampdu);
+	seq_printf(m, "tx_noagg_not_qos= %d\n",
+		   wifi->stats.tx_noagg_not_qos);
 	seq_printf(m, "oustanding_cmd_cnt = %d\n",
 		   wifi->stats.outstanding_cmd_cnt);
 	seq_printf(m, "gen_cmd_send_count = %d\n",
@@ -3458,12 +3466,37 @@ static int proc_read_mac_stats(struct seq_file *m, void *v)
 		   wifi->stats.tx_cmd_send_count_single);
 	seq_printf(m, "tx_cmd_send_count_multi = %d\n",
 		   wifi->stats.tx_cmd_send_count_multi);
+	seq_printf(m, "tx_cmd_send_count_beacon_q = %d\n",
+		   wifi->stats.tx_cmd_send_count_beaconq);
 	seq_printf(m, "tx_done_recv_count = %d\n",
 		   wifi->stats.tx_done_recv_count);
 
 	dev = (struct mac80211_dev *)(wifi->hw->priv);
 	seq_printf(m, "tx_buff_pool_map = %ld\n",
 		   dev->tx.buf_pool_bmp[0]);
+	{
+		int i, j;
+		struct sk_buff_head *pend_pkt_q;
+
+		seq_puts(m, "Pending Qs status\n");
+		for (i = 0; i < MAX_PEERS; i++) {
+			if (!dev->peers[i])
+				continue;
+
+			for (j = 0; j < WLAN_AC_MAX_CNT; j++) {
+				spin_lock_bh(&dev->tx.lock);
+				pend_pkt_q = &dev->tx.pending_pkt[0][i][j];
+				if (skb_queue_len(pend_pkt_q))
+					seq_printf(m, "ac:%d peer:%d = %d\n",
+						   j,
+						   i,
+						   skb_queue_len(pend_pkt_q));
+				spin_unlock_bh(&dev->tx.lock);
+			}
+		}
+		seq_puts(m, "\n");
+	}
+
 	if (ftm)
 		seq_printf(m, "pdout_val = %d (total samples: %d)\n",
 			   total_samples ? (total_value/total_samples) : 0,
@@ -3720,6 +3753,12 @@ static ssize_t proc_write_config(struct file *file,
 		} else
 			pr_err("Invalid parameter value: Allowed Range: 1 to %d\n",
 			       min(MAX_TX_STREAMS, MAX_RX_STREAMS));
+	} else if (param_get_val(buf, "enable_early_agg_checks=", &val)) {
+		if ((val == 0) || (val == 1)) {
+			if (val != wifi->params.enable_early_agg_checks)
+				wifi->params.enable_early_agg_checks = val;
+		} else
+			pr_err("Invalid parameter value: Allowed: 0/1\n");
 	} else if (param_get_val(buf, "antenna_sel=", &val)) {
 		if (val == 1 || val == 2) {
 			if (val != wifi->params.antenna_sel) {
@@ -4582,6 +4621,7 @@ static int proc_init(struct proc_dir_entry ***main_dir_entry)
 	if (num_streams_vpd > 0)
 		wifi->params.uccp_num_spatial_streams = num_streams_vpd;
 
+	wifi->params.enable_early_agg_checks = 1;
 	wifi->params.bt_state = 1;
 	wifi->params.mgd_mode_tx_fixed_mcs_indx = -1;
 	wifi->params.mgd_mode_tx_fixed_rate = -1;

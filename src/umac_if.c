@@ -1696,10 +1696,14 @@ int uccp420wlan_prog_tx(unsigned int queue,
 		/* increment tx_cmd_send_count to keep track of number of
 		 * tx_cmd send
 		 */
-		if (skb_queue_len(txq) == 1)
-			dev->stats->tx_cmd_send_count_single++;
-		else if (skb_queue_len(txq) > 1)
-			dev->stats->tx_cmd_send_count_multi++;
+		if (queue != WLAN_AC_BCN) {
+			if (skb_queue_len(txq) == 1)
+				dev->stats->tx_cmd_send_count_single++;
+			else if (skb_queue_len(txq) > 1)
+				dev->stats->tx_cmd_send_count_multi++;
+		} else {
+			dev->stats->tx_cmd_send_count_beaconq++;
+		}
 #ifdef PERF_PROFILING
 	}
 #endif

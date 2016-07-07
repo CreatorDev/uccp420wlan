@@ -89,6 +89,72 @@ static void update_aux_adc_voltage(struct mac80211_dev *dev,
 	dev->params->pdout_voltage[index++] = pdout;
 }
 
+static int check_80211_aggregation(struct mac80211_dev *dev,
+				   struct sk_buff *skb,
+				   int ac,
+#ifdef MULTI_CHAN_SUPPORT
+				   int off_chanctx_idx,
+#endif
+				   int peer_id)
+{
+	struct ieee80211_tx_info *tx_info = IEEE80211_SKB_CB(skb);
+	struct ieee80211_hdr *mac_hdr = NULL, *mac_hdr_first = NULL;
+	struct sk_buff *skb_first;
+	struct sk_buff_head *pend_pkt_q = NULL;
+	struct tx_config *tx = &dev->tx;
+	bool ampdu = false, is_qos = false, addr = true;
+
+	mac_hdr = (struct ieee80211_hdr *)skb->data;
+#ifdef MULTI_CHAN_SUPPORT
+	pend_pkt_q = &tx->pending_pkt[off_chanctx_idx][peer_id][ac];
+#else
+	pend_pkt_q = &tx->pending_pkt[peer_id][ac];
+#endif
+	skb_first = skb_peek(pend_pkt_q);
+	if (skb_first)
+		mac_hdr_first = (struct ieee80211_hdr *)skb_first->data;
+
+	ampdu = (tx_info->flags & IEEE80211_TX_CTL_AMPDU) ? true : false;
+	is_qos = ieee80211_is_data_qos(mac_hdr->frame_control);
+
+	/* RPU has a limitation, it expects A1-A2-A3 to be same
+	* for all MPDU's within an AMPDU. This is a temporary
+	* solution, remove it when RPU has fix for this.
+	*/
+	if (skb_first &&
+	    ((!ether_addr_equal(mac_hdr->addr1,
+		       mac_hdr_first->addr1)) ||
+	    (!ether_addr_equal(mac_hdr->addr2,
+		       mac_hdr_first->addr2)) ||
+	    (!ether_addr_equal(mac_hdr->addr3,
+		       mac_hdr_first->addr3)))) {
+		addr = false;
+	}
+
+	/*stats and debug*/
+	if (!is_qos) {
+		UCCP_DEBUG_TX("Not Qos\n");
+		dev->stats->tx_noagg_not_qos++;
+	} else if (!ampdu) {
+		UCCP_DEBUG_TX("Not AMPDU\n");
+		dev->stats->tx_noagg_not_ampdu++;
+	} else if (!addr) {
+		if (skb_first) {
+			UCCP_DEBUG_TX("first: A1: %pM-A2:%pM -A3%pM not same\n",
+				      mac_hdr_first->addr1,
+				      mac_hdr_first->addr2,
+				      mac_hdr_first->addr3);
+			UCCP_DEBUG_TX("curr:  A1: %pM-A2:%pM -A3%pM not same\n",
+				      mac_hdr->addr1,
+				      mac_hdr->addr2,
+				      mac_hdr->addr3);
+		}
+		dev->stats->tx_noagg_not_addr++;
+	}
+
+	return (ampdu && is_qos && addr);
+}
+
 static void tx_status(struct sk_buff *skb,
 		      struct umac_event_tx_done *tx_done,
 		      unsigned int frame_idx,
@@ -266,7 +332,6 @@ static int get_token(struct mac80211_dev *dev,
 		     token_id++) {
 			curr_bit = (token_id % TX_DESC_BUCKET_BOUND);
 			pool_id = (token_id / TX_DESC_BUCKET_BOUND);
-			/* Do not set, we will queue to the same token */
 			if (!test_and_set_bit(curr_bit,
 					      &tx->buf_pool_bmp[pool_id])) {
 				tx->outstanding_tokens[queue]++;
@@ -285,13 +350,22 @@ void free_token(struct mac80211_dev *dev,
 	struct tx_config *tx = &dev->tx;
 	int bit = -1;
 	int pool_id = -1;
-
+	int test = 0;
+	unsigned int old_token = tx->outstanding_tokens[queue];
 	bit = (token_id % TX_DESC_BUCKET_BOUND);
 	pool_id = (token_id / TX_DESC_BUCKET_BOUND);
 
 	__clear_bit(bit, &tx->buf_pool_bmp[pool_id]);
 
 	tx->outstanding_tokens[queue]--;
+
+	test = tx->outstanding_tokens[queue];
+	if (WARN_ON_ONCE(test < 0 || test > 4)) {
+		pr_warn("%s: invalid outstanding_tokens: %d, old:%d\n",
+			__func__,
+			test,
+			old_token);
+	}
 }
 
 
@@ -578,10 +652,7 @@ int uccp420wlan_tx_proc_pend_frms(struct mac80211_dev *dev,
 	unsigned long ampdu_len = 0;
 	struct sk_buff *loop_skb = NULL;
 	struct sk_buff *tmp = NULL;
-	struct sk_buff *skb_first = NULL;
-	struct ieee80211_hdr *mac_hdr_first = NULL;
 	struct ieee80211_hdr *mac_hdr = NULL;
-	struct ieee80211_tx_info *tx_info_first = NULL;
 	struct ieee80211_tx_info *tx_info = NULL;
 	struct umac_vif *uvif = NULL;
 	struct ieee80211_vif *ivif = NULL;
@@ -592,7 +663,7 @@ int uccp420wlan_tx_proc_pend_frms(struct mac80211_dev *dev,
 	unsigned int total_pending_processed = 0;
 	int pend_pkt_q_len = 0;
 	struct curr_peer_info peer_info;
-
+	int loop_cnt = 0;
 	peer_info = get_curr_peer_opp(dev,
 #ifdef MULTI_CHAN_SUPPORT
 				       curr_chanctx_idx,
@@ -616,24 +687,6 @@ int uccp420wlan_tx_proc_pend_frms(struct mac80211_dev *dev,
 	txq = &dev->tx.pkt_info[token_id].pkt;
 #endif
 
-	skb_first = skb_peek(pend_pkt_q);
-
-	if (skb_first == NULL)
-		pr_err("%s:%d Null SKB: peer: %d\n",
-		       __func__,
-		       __LINE__,
-		       peer_info.id);
-
-	mac_hdr_first = (struct ieee80211_hdr *)skb_first->data;
-
-	tx_info_first = IEEE80211_SKB_CB(skb_first);
-
-	/* Temp Checks for Aggregation: Will be removed later*/
-	if (vht_support)
-		if ((tx_info_first->control.rates[0].flags &
-		     IEEE80211_TX_RC_MCS) &&
-		    max_tx_cmds > MAX_SUBFRAMES_IN_AMPDU_HT)
-			max_tx_cmds = MAX_SUBFRAMES_IN_AMPDU_HT;
 
 	/* Aggregate Only MPDU's with same RA, same Rate,
 	 * same Rate flags, same Tx Info flags
@@ -651,34 +704,28 @@ int uccp420wlan_tx_proc_pend_frms(struct mac80211_dev *dev,
 
 		ampdu_len += loop_skb->len;
 
-		if (!ieee80211_is_data(mac_hdr->frame_control) ||
-		    !(tx_info->flags & IEEE80211_TX_CTL_AMPDU) ||
-		    (skb_queue_len(txq) >= max_tx_cmds) ||
-#if 0
-		    (memcmp(&tx_info_first->control.rates[0],
-			    &tx_info->control.rates[0],
-			    sizeof(struct ieee80211_tx_rate) *
-			    IEEE80211_TX_MAX_RATES) != 0) ||
-		    (tx_info_first->flags != tx_info->flags) ||
-#endif
-		    /* RPU has a limitation, it expects A1-A2-A3 to be same
-		     * for all MPDU's within an AMPDU. This is a temporary
-		     * solution, remove it when RPU has fix for this.
-		     */
-		    (!ether_addr_equal(mac_hdr->addr1,
-				       mac_hdr_first->addr1)) ||
-		    (!ether_addr_equal(mac_hdr->addr2,
-				       mac_hdr_first->addr2)) ||
-		    (!ether_addr_equal(mac_hdr->addr3,
-				       mac_hdr_first->addr3)))
+		/* Temp Checks for Aggregation: Will be removed later*/
+		if (vht_support && !loop_cnt)
+			if ((tx_info->control.rates[0].flags &
+			     IEEE80211_TX_RC_MCS) &&
+			    max_tx_cmds > MAX_SUBFRAMES_IN_AMPDU_HT)
+				max_tx_cmds = MAX_SUBFRAMES_IN_AMPDU_HT;
+		if (!check_80211_aggregation(dev,
+					     loop_skb,
+					     ac,
+					     curr_chanctx_idx,
+					     peer_info.id) ||
+		    (skb_queue_len(txq) >= max_tx_cmds)) {
 			break;
-
+		}
+		loop_cnt++;
 		__skb_unlink(loop_skb, pend_pkt_q);
-
 		skb_queue_tail(txq, loop_skb);
 	}
 
-	/* If our criterion rejects all pending frames, send only 1 */
+	/* If our criterion rejects all pending frames, or
+	 * pend_q is empty, send only 1
+	 */
 	if (!skb_queue_len(txq))
 		skb_queue_tail(txq, skb_dequeue(pend_pkt_q));
 
@@ -715,7 +762,8 @@ int uccp420wlan_tx_alloc_token(struct mac80211_dev *dev,
 	struct tx_config *tx = &dev->tx;
 	struct sk_buff_head *pend_pkt_q = NULL;
 	unsigned int pkts_pend = 0;
-
+	struct ieee80211_tx_info *tx_info;
+	unsigned int pend_q_len = 0;
 	spin_lock_bh(&tx->lock);
 
 #ifdef MULTI_CHAN_SUPPORT
@@ -724,7 +772,6 @@ int uccp420wlan_tx_alloc_token(struct mac80211_dev *dev,
 #else
 	pend_pkt_q = &tx->pending_pkt[peer_id][ac];
 #endif
-
 #ifdef MULTI_CHAN_SUPPORT
 	UCCP_DEBUG_TX("%s-UMACTX:Alloc buf Req q = %d off_chan: %d\n",
 					dev->name,
@@ -739,15 +786,30 @@ int uccp420wlan_tx_alloc_token(struct mac80211_dev *dev,
 
 	/* Queue the frame to the pending frames queue */
 	skb_queue_tail(pend_pkt_q, skb);
+	pend_q_len = skb_queue_len(pend_pkt_q);
 
-	/* If the number of outstanding Tx tokens is greater than
-	 * NUM_TX_DESCS_PER_AC we try and encourage aggregation to the max size
-	 * supported (dev->params->max_tx_cmds)
-	 */
+	tx_info = IEEE80211_SKB_CB(skb);
+
 	if (tx->outstanding_tokens[ac] >= NUM_TX_DESCS_PER_AC) {
-		if ((skb_queue_len(pend_pkt_q) < dev->params->max_tx_cmds) ||
-		   ac == WLAN_AC_BCN)
-			goto out;
+		bool agg_status = check_80211_aggregation(dev,
+						      skb,
+						      ac,
+						      off_chanctx_idx,
+						      peer_id);
+
+		if (agg_status || !dev->params->enable_early_agg_checks) {
+			/* encourage aggregation to the max size
+			 * supported (dev->params->max_tx_cmds)
+			 */
+			if (pend_q_len < dev->params->max_tx_cmds) {
+				UCCP_DEBUG_TX("tx:pend_q not full out_tok:%d\n",
+					      tx->outstanding_tokens[ac]);
+				goto out;
+			 } else {
+				UCCP_DEBUG_TX("tx:pend_q full out_tok:%d\n",
+					      tx->outstanding_tokens[ac]);
+			}
+		}
 	}
 
 	/* Take steps to stop the TX traffic if we have reached
@@ -757,7 +819,7 @@ int uccp420wlan_tx_alloc_token(struct mac80211_dev *dev,
 	 * the shared ROC queue (which is VO right now), since this would block
 	 * ROC traffic too.
 	 */
-	if (skb_queue_len(pend_pkt_q) >= MAX_TX_QUEUE_LEN) {
+	if (pend_q_len >= MAX_TX_QUEUE_LEN) {
 		if ((!dev->roc_params.roc_in_progress) ||
 		    (dev->roc_params.roc_in_progress &&
 		     (ac != UMAC_ROC_AC))) {
@@ -863,7 +925,11 @@ int uccp420wlan_tx_free_buff_req(struct mac80211_dev *dev,
 	chanctx_idx = tx->desc_chan_map[desc_id];
 	if (chanctx_idx == -1) {
 		spin_unlock_bh(&tx->lock);
-		pr_err("%s: Unexpected channel context\n", __func__);
+		pr_err("%s: Unexpected channel context:tok:%d q:%d\n",
+		       __func__,
+		       desc_id,
+		       tx_done->queue);
+		free_token(dev, desc_id, tx_done->queue);
 		goto out;
 	}
 	pkt_info = &dev->tx.pkt_info[chanctx_idx][desc_id];
@@ -939,12 +1005,20 @@ int uccp420wlan_tx_free_buff_req(struct mac80211_dev *dev,
 		}
 	}
 
+	if (!pkts_pend) {
+		/* Mark the token as available */
+		free_token(dev, desc_id, tx_done->queue);
+#ifdef MULTI_CHAN_SUPPORT
+		dev->tx.desc_chan_map[desc_id] = -1;
+#endif
+	}
+
 	/* Unlock: Give a chance for Tx to add to pending lists */
 	spin_unlock_bh(&tx->lock);
 
 	/* Protection from mac80211 _ops especially stop */
 	if (dev->state != STARTED)
-		return 0;
+		goto out;
 
 	if (!skb_queue_len(&tx_done_list))
 		goto out;
@@ -1752,13 +1826,6 @@ void uccp420wlan_tx_complete(struct umac_event_tx_done *tx_done,
 #ifdef MULTI_CHAN_SUPPORT
 out:
 #endif
-	if (!pkts_pending) {
-		/* Mark the token as available */
-		free_token(dev, token_id, tx_done->queue);
-#ifdef MULTI_CHAN_SUPPORT
-		dev->tx.desc_chan_map[token_id] = -1;
-#endif
-	}
 
 	for (vif_index = 0; vif_index < MAX_VIFS; vif_index++) {
 		if (vif_index_bitmap & (1 << vif_index)) {

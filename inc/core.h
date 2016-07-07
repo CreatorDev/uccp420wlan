@@ -220,6 +220,7 @@ struct wifi_params {
 	unsigned char is_associated;
 	unsigned char rate_protection_type;
 	unsigned char num_spatial_streams;
+	unsigned char enable_early_agg_checks;
 	unsigned char uccp_num_spatial_streams;
 	unsigned char auto_sensitivity;
 	/*RF Params: Input to the RF for operation*/
@@ -328,6 +329,12 @@ struct wifi_stats {
 	unsigned int gen_cmd_send_count;
 	unsigned int tx_cmd_send_count_single;
 	unsigned int tx_cmd_send_count_multi;
+
+	unsigned int tx_noagg_not_qos;
+	unsigned int tx_noagg_not_ampdu;
+	unsigned int tx_noagg_not_addr;
+
+	unsigned int tx_cmd_send_count_beaconq;
 	unsigned int tx_done_recv_count;
 	unsigned int rx_packet_mgmt_count;
 	unsigned int rx_packet_data_count;
