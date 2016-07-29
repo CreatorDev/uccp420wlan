@@ -361,10 +361,10 @@ void free_token(struct mac80211_dev *dev,
 
 	test = tx->outstanding_tokens[queue];
 	if (WARN_ON_ONCE(test < 0 || test > 4)) {
-		pr_warn("%s: invalid outstanding_tokens: %d, old:%d\n",
-			__func__,
-			test,
-			old_token);
+		UCCP_DEBUG_TX("%s: invalid outstanding_tokens: %d, old:%d\n",
+			      __func__,
+			      test,
+			      old_token);
 	}
 }
 
@@ -863,9 +863,9 @@ int uccp420wlan_tx_alloc_token(struct mac80211_dev *dev,
 out:
 	spin_unlock_bh(&tx->lock);
 
-	UCCP_DEBUG_TX("%s-UMACTX:Alloc buf Result *id= %d\n",
+	UCCP_DEBUG_TX("%s-UMACTX:Alloc buf Result *id= %d out_tok:%d\n",
 					dev->name,
-					token_id);
+					token_id, tx->outstanding_tokens[ac]);
 	/* If token is available, just return tokenid, list will be sent*/
 	return token_id;
 }
@@ -985,6 +985,12 @@ int uccp420wlan_tx_free_buff_req(struct mac80211_dev *dev,
 
 		if (pkts_pend) {
 			*ac = cnt;
+			/* Spare Token Case*/
+			if (tx_done->queue != *ac) {
+				/*Adjust the counters*/
+				tx->outstanding_tokens[tx_done->queue]--;
+				tx->outstanding_tokens[*ac]++;
+			}
 			break;
 		}
 	}
@@ -1361,6 +1367,12 @@ unsigned int uccp420wlan_proc_tx_dscrd_chsw(struct mac80211_dev *dev,
 						      desc_id);
 			if (pkts_pend) {
 				queue = cnt;
+				if (tx_done->queue != queue) {
+					unsigned int txd_q = tx_done->queue;
+					/*Adjust the counters*/
+					tx->outstanding_tokens[txd_q]--;
+					tx->outstanding_tokens[queue]++;
+				}
 				break;
 			}
 		}
@@ -1388,16 +1400,6 @@ unsigned int uccp420wlan_proc_tx_dscrd_chsw(struct mac80211_dev *dev,
 		goto tx_done;
 	}
 
-	if (txq_len == 1)
-		dev->stats->tx_cmd_send_count_single--;
-	else
-		dev->stats->tx_cmd_send_count_multi--;
-
-out:
-	spin_unlock_bh(&tx->lock);
-
-	return pkts_pend;
-
 tx_done:
 	skb_queue_walk_safe(&tx_done_list, skb, tmp) {
 			tx_status(skb,
@@ -1406,6 +1408,15 @@ tx_done:
 				  dev,
 				  tx_info_1st_mpdu);
 	}
+
+	spin_lock_bh(&tx->lock);
+out:
+	if (!pkts_pend) {
+		/* Mark the token as available */
+		free_token(dev, desc_id, tx_done->queue);
+		dev->tx.desc_chan_map[desc_id] = -1;
+	}
+	spin_unlock_bh(&tx->lock);
 
 	return pkts_pend;
 }
