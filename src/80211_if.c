@@ -22,40 +22,39 @@
  * USA.
  */
 
+#include <linux/device.h>
+#include <linux/etherdevice.h>
+#include <linux/firmware.h>
+#include <linux/interrupt.h>
+#include <linux/ip.h>
 #include <linux/kernel.h>
 #include <linux/moduleparam.h>
+#include <linux/platform_device.h>
+#include <linux/proc_fs.h>
+#include <linux/udp.h>
 #include <linux/version.h>
-#include <linux/device.h>
 
-#include <net/mac80211.h>
 #include <net/cfg80211.h>
 #include <net/ieee80211_radiotap.h>
+#include <net/mac80211.h>
 
-#include <linux/udp.h>
-#include <linux/ip.h>
-#include <linux/etherdevice.h>
-#include <linux/platform_device.h>
-#include <linux/interrupt.h>
-#include <linux/proc_fs.h>
-
-#include "version.h"
 #include "core.h"
+#include "fwldr.h"
 #include "utils.h"
+#include "version.h"
 
-#include <linux/firmware.h>
 
-#include <fwldr.h>
 
-#define UCCP_DEBUG_80211IF(fmt, ...)                           \
-do {                                                                    \
-		if (uccp_debug & UCCP_DEBUG_80211IF)                       \
-			pr_debug(fmt, ##__VA_ARGS__);  \
+#define UCCP_DEBUG_80211IF(fmt, ...)        \
+do {                                         \
+	if (uccp_debug & UCCP_DEBUG_80211IF)  \
+		pr_debug(fmt, ##__VA_ARGS__);  \
 } while (0)
 
-#define UCCP_DEBUG_CRYPTO(fmt, ...)                           \
-do {                                                                    \
-		if (uccp_debug & UCCP_DEBUG_CRYPTO)                       \
-			pr_debug(fmt, ##__VA_ARGS__);  \
+#define UCCP_DEBUG_CRYPTO(fmt, ...)           \
+do {                                           \
+	if (uccp_debug & UCCP_DEBUG_CRYPTO)     \
+		pr_debug(fmt, ##__VA_ARGS__);    \
 } while (0)
 
 /* Its value will be the default mac address and it can only be updated with the
@@ -351,6 +350,9 @@ static void uccp420_roc_complete_work(struct work_struct *work)
 	dev = container_of(dwork, struct mac80211_dev, roc_complete_work);
 	tx = &dev->tx;
 
+	if (dev->roc_params.roc_in_progress == 0)
+		return;
+
 	mutex_lock(&dev->mutex);
 #ifdef MULTI_CHAN_SUPPORT
 	need_offchan = dev->roc_params.need_offchan;
@@ -381,7 +383,8 @@ static void uccp420_roc_complete_work(struct work_struct *work)
 					 uvif,
 					 uvif->off_chanctx->index,
 					 BIT(UMAC_ROC_AC),
-					 UMAC_VIF_CHANCTX_TYPE_OFF);
+					 UMAC_VIF_CHANCTX_TYPE_OFF,
+					 TX_DROP);
 
 
 		spin_lock_bh(&tx->lock);
@@ -689,6 +692,7 @@ static int config(struct ieee80211_hw *hw,
 	int i = 0;
 	int err = 0;
 	struct ieee80211_vif *vif = NULL;
+	int ret = 0;
 
 	UCCP_DEBUG_80211IF("%s-80211IF:In config\n", dev->name);
 
@@ -696,7 +700,7 @@ static int config(struct ieee80211_hw *hw,
 
 	if (changed & IEEE80211_CONF_CHANGE_POWER) {
 		dev->txpower = conf->power_level;
-		uccp420wlan_prog_txpower(dev->txpower);
+		CALL_UMAC(uccp420wlan_prog_txpower, dev->txpower);
 	}
 
 	/* Check for change in channel */
@@ -730,7 +734,8 @@ static int config(struct ieee80211_hw *hw,
 					   pri_chnl_num,
 					   ch_width);
 
-			uccp420wlan_prog_radar_detect(RADAR_DETECT_OP_START);
+			CALL_UMAC(uccp420wlan_prog_radar_detect,
+				  RADAR_DETECT_OP_START);
 		}
 	}
 
@@ -821,8 +826,9 @@ static int config(struct ieee80211_hw *hw,
 					    conf->long_frame_max_tx_count);
 	}
 
+prog_umac_fail:
 	mutex_unlock(&dev->mutex);
-	return 0;
+	return ret;
 }
 
 
@@ -833,6 +839,7 @@ static u64 prepare_multicast(struct ieee80211_hw *hw,
 	int i;
 	struct netdev_hw_addr *ha;
 	int mc_count = 0;
+	int ret = 0;
 
 	if (dev->state != STARTED)
 		return 0;
@@ -861,7 +868,9 @@ static u64 prepare_multicast(struct ieee80211_hw *hw,
 
 	netdev_hw_addr_list_for_each(ha, mc_list) {
 		/* Prog the multicast address into the LMAC */
-		uccp420wlan_prog_mcast_addr_cfg(ha->addr, WLAN_MCAST_ADDR_ADD);
+		CALL_UMAC(uccp420wlan_prog_mcast_addr_cfg,
+			  ha->addr,
+			  WLAN_MCAST_ADDR_ADD);
 		memcpy(dev->mc_filters[i], ha->addr, 6);
 		i++;
 	}
@@ -869,6 +878,8 @@ static u64 prepare_multicast(struct ieee80211_hw *hw,
 	dev->mc_filter_count = mc_count;
 out:
 	return mc_count;
+prog_umac_fail:
+	return ret;
 }
 
 
@@ -878,6 +889,7 @@ static void configure_filter(struct ieee80211_hw *hw,
 		u64 mc_count)
 {
 	struct mac80211_dev *dev = hw->priv;
+	int ret = 0;
 
 	mutex_lock(&dev->mutex);
 
@@ -892,13 +904,15 @@ static void configure_filter(struct ieee80211_hw *hw,
 	if ((*new_flags & FIF_ALLMULTI) || (mc_count == 0)) {
 		/* Disable the multicast filter in LMAC */
 		UCCP_DEBUG_80211IF("%s-80211IF: Multicast filters disabled\n",
-			       dev->name);
-		uccp420wlan_prog_mcast_filter_control(MCAST_FILTER_DISABLE);
+				   dev->name);
+		CALL_UMAC(uccp420wlan_prog_mcast_filter_control,
+			  MCAST_FILTER_DISABLE);
 	} else if (mc_count) {
 		/* Enable the multicast filter in LMAC */
 		UCCP_DEBUG_80211IF("%s-80211IF: Multicast filters enabled\n",
 			       dev->name);
-		uccp420wlan_prog_mcast_filter_control(MCAST_FILTER_ENABLE);
+		CALL_UMAC(uccp420wlan_prog_mcast_filter_control,
+			  MCAST_FILTER_ENABLE);
 	}
 
 	if (changed_flags == 0)
@@ -910,20 +924,22 @@ static void configure_filter(struct ieee80211_hw *hw,
 			/* Receive all beacons and probe responses */
 			UCCP_DEBUG_80211IF("%s-80211IF: RCV ALL bcns\n",
 				       dev->name);
-			uccp420wlan_prog_rcv_bcn_mode(RCV_ALL_BCNS);
+			CALL_UMAC(uccp420wlan_prog_rcv_bcn_mode, RCV_ALL_BCNS);
 		} else {
 			/* Receive only network beacons and probe responses */
 			UCCP_DEBUG_80211IF("%s-80211IF: RCV NW bcns\n",
-				       dev->name);
-			uccp420wlan_prog_rcv_bcn_mode(RCV_ALL_NETWORK_ONLY);
+					   dev->name);
+			CALL_UMAC(uccp420wlan_prog_rcv_bcn_mode,
+				  RCV_ALL_NETWORK_ONLY);
 		}
 	}
 out:
 	if (wifi->params.production_test == 1) {
 		UCCP_DEBUG_80211IF("%s-80211IF: RCV ALL bcns\n", dev->name);
-		uccp420wlan_prog_rcv_bcn_mode(RCV_ALL_BCNS);
+		CALL_UMAC(uccp420wlan_prog_rcv_bcn_mode, RCV_ALL_BCNS);
 	}
 
+prog_umac_fail:
 	mutex_unlock(&dev->mutex);
 }
 
@@ -1385,6 +1401,7 @@ static void init_hw(struct ieee80211_hw *hw)
 	ieee80211_hw_set(hw, SUPPORTS_PER_STA_GTK);
 	ieee80211_hw_set(hw, CONNECTION_MONITOR);
 	ieee80211_hw_set(hw, CHANCTX_STA_CSA);
+	ieee80211_hw_set(hw, SUPPORT_FAST_XMIT);
 
 	hw->wiphy->max_scan_ssids = MAX_NUM_SSIDS; /* 4 */
 	 /* Low priority bg scan */
@@ -1550,6 +1567,7 @@ static int remain_on_channel(struct ieee80211_hw *hw,
 	struct ieee80211_chanctx_conf *vif_chanctx;
 	bool need_offchan = true;
 #endif
+	int ret = 0;
 
 	mutex_lock(&dev->mutex);
 	UCCP_DEBUG_ROC("%s:%d The Params are:",
@@ -1646,7 +1664,8 @@ static int remain_on_channel(struct ieee80211_hw *hw,
 					uvif,
 					uvif->chanctx->index,
 					hw_queue_map,
-					UMAC_VIF_CHANCTX_TYPE_OPER);
+					UMAC_VIF_CHANCTX_TYPE_OPER,
+					TX_FLUSH);
 		}
 
 
@@ -1692,17 +1711,20 @@ static int remain_on_channel(struct ieee80211_hw *hw,
 	uvif->off_chanctx = off_chanctx;
 	spin_unlock_bh(&tx->lock);
 #endif
-
-	uccp420wlan_prog_roc(ROC_START, pri_chnl_num, duration, type);
+	CALL_UMAC(uccp420wlan_prog_roc,
+		  ROC_START,
+		  pri_chnl_num,
+		  duration,
+		  type);
 
 #ifdef MULTI_CHAN_SUPPORT
 	if (uvif->chanctx)
 		ieee80211_wake_queues(hw);
 #endif
 
+prog_umac_fail:
 	mutex_unlock(&dev->mutex);
-
-	return 0;
+	return ret;
 }
 
 
@@ -1718,7 +1740,7 @@ static int cancel_remain_on_channel(struct ieee80211_hw *hw)
 		dev->cancel_roc = 1;
 		UCCP_DEBUG_ROC("%s:%d Cancelling HW ROC....\n",
 				__func__, __LINE__);
-		uccp420wlan_prog_roc(ROC_STOP, 0, 0, 0);
+		CALL_UMAC(uccp420wlan_prog_roc, ROC_STOP, 0, 0, 0);
 
 		mutex_unlock(&dev->mutex);
 
@@ -1733,10 +1755,9 @@ static int cancel_remain_on_channel(struct ieee80211_hw *hw)
 							__LINE__);
 			ret = -1;
 		}
-	} else {
-		mutex_unlock(&dev->mutex);
 	}
-
+prog_umac_fail:
+	mutex_unlock(&dev->mutex);
 	return ret;
 }
 
@@ -2129,9 +2150,35 @@ int sta_remove(struct ieee80211_hw *hw,
 	int result = 0;
 	struct mac80211_dev *dev = hw->priv;
 	struct umac_sta *usta = (struct umac_sta *)sta->drv_priv;
+	struct tx_config *tx = &dev->tx;
+	u32 hw_queue_map = 0;
 
 	for (i = 0; i < ETH_ALEN; i++)
 		peer_st_info.addr[i] = sta->addr[i];
+
+	/*purge the queues*/
+
+	for (i = 0; i < NUM_ACS; i++)
+		hw_queue_map |= BIT(i);
+
+	spin_lock_bh(&tx->lock);
+	UCCP_DEBUG_TX("%s:%d discard tx\n", __func__, __LINE__);
+	uccp420_discard_sta_pend_q(dev, uvif, usta->index, hw_queue_map);
+	spin_unlock_bh(&tx->lock);
+	dev->tx_deinit_complete = 0;
+	uccp420wlan_prog_tx_deinit(usta->vif_index, sta->addr);
+
+	if (wait_for_tx_deinit_complete(dev) < 0) {
+		WARN_ON(1);
+		spin_lock_bh(&tx->lock);
+		UCCP_DEBUG_TX("%s:%d discarding\n", __func__, __LINE__);
+		uccp420_discard_sta_tx_q(dev,
+					 uvif,
+					 usta->index,
+					 hw_queue_map,
+					 usta->chanctx->index);
+		spin_unlock_bh(&tx->lock);
+	}
 
 	result = uccp420wlan_sta_remove(uvif->vif_index, &peer_st_info);
 
@@ -2291,9 +2338,10 @@ static int rpu_testmode_dump(struct ieee80211_hw *hw, struct sk_buff *skb,
 
 	curr_dump = ((char *)dump_start) + (MAX_NL_DUMP_LEN * idx);
 
-	if (!curr_dump  || (curr_dump < (char *)dump_start) ||
-		(curr_dump > ((char *)dump_start + dump_len)))
-			goto dump_fail;
+	if (!curr_dump  ||
+	    (curr_dump < (char *)dump_start) ||
+	    (curr_dump > ((char *)dump_start + dump_len)))
+		goto dump_fail;
 
 	if (curr_msg_len > skb_tailroom(skb))
 		goto dump_fail;
@@ -2361,7 +2409,7 @@ static int add_chanctx(struct ieee80211_hw *hw,
 
 	dev = hw->priv;
 
-	UCCP_DEBUG_TSMC("GOT add chanctx\n");
+	UCCP_DEBUG_80211IF("GOT add chanctx\n");
 
 	for (i = 0; i < MAX_CHANCTX; i++) {
 		if (!dev->chanctx[i]) {
@@ -2375,7 +2423,7 @@ static int add_chanctx(struct ieee80211_hw *hw,
 		return -1;
 	}
 
-	UCCP_DEBUG_TSMC("%s: %d MHz\n",
+	UCCP_DEBUG_80211IF("%s: %d MHz\n",
 			__func__,
 			conf->def.chan->center_freq);
 
@@ -2402,9 +2450,9 @@ static void remove_chanctx(struct ieee80211_hw *hw,
 
 	dev = hw->priv;
 	ctx = (struct umac_chanctx *)conf->drv_priv;
-	UCCP_DEBUG_TSMC("GOT remove chanctx\n");
+	UCCP_DEBUG_80211IF("GOT remove chanctx\n");
 
-	UCCP_DEBUG_TSMC("%s: %d MHz\n",
+	UCCP_DEBUG_80211IF("%s: %d MHz\n",
 					 __func__,
 					 conf->def.chan->center_freq);
 
@@ -2433,18 +2481,20 @@ static void change_chanctx(struct ieee80211_hw *hw,
 	int i = 0;
 	int center_freq = 0;
 	int chan = 0;
-	int err = 0;
+	int err = 0, ret = 0;
 
 	dev = hw->priv;
 	ctx = (struct umac_chanctx *)conf->drv_priv;
 
-	UCCP_DEBUG_TSMC("Got change_chanctx: %d\n", changed);
-	pr_err("%s: %d MHz\n", __func__, conf->def.chan->center_freq);
+	UCCP_DEBUG_80211IF("Got change_chanctx: %d\n", changed);
+	UCCP_DEBUG_80211IF("%s: %d MHz\n", __func__,
+			   conf->def.chan->center_freq);
 
 	if (changed & IEEE80211_CHANCTX_CHANGE_WIDTH ||
 	    changed & IEEE80211_CHANCTX_CHANGE_CHANNEL) {
-		pr_err("%s channel width = %d channel = %d\n", __func__,
-				conf->def.width, conf->def.center_freq1);
+		UCCP_DEBUG_80211IF("%s channel width = %d channel = %d\n",
+				   __func__,
+				   conf->def.width, conf->def.center_freq1);
 
 		center_freq = conf->def.chan->center_freq;
 		chan = ieee80211_frequency_to_channel(center_freq);
@@ -2461,7 +2511,7 @@ static void change_chanctx(struct ieee80211_hw *hw,
 	}
 
 	if (changed & IEEE80211_CHANCTX_CHANGE_MIN_WIDTH) {
-		UCCP_DEBUG_TSMC("%s Minimum channel width = %d\n", __func__,
+		UCCP_DEBUG_80211IF("%s Minimum channel width = %d\n", __func__,
 			conf->min_def.width);
 
 		center_freq = conf->min_def.chan->center_freq;
@@ -2482,9 +2532,10 @@ static void change_chanctx(struct ieee80211_hw *hw,
 
 	/* TODO: Make this global config as it effects all VIF's */
 	if (changed & IEEE80211_CHANCTX_CHANGE_RX_CHAINS) {
-		UCCP_DEBUG_TSMC("%s rx_chains_static=%d rx_chains_dynamic=%d\n",
-			__func__, conf->rx_chains_static,
-			conf->rx_chains_dynamic);
+		UCCP_DEBUG_80211IF("%s rx_chains static=%d dynamic=%d\n",
+				   __func__,
+				   conf->rx_chains_static,
+				   conf->rx_chains_dynamic);
 
 		list_for_each_entry(uvif, &ctx->vifs, list) {
 			for (i = 0; i < MAX_VIFS; i++) {
@@ -2518,10 +2569,14 @@ static void change_chanctx(struct ieee80211_hw *hw,
 				   conf->radar_enabled);
 
 		if (conf->radar_enabled)
-			uccp420wlan_prog_radar_detect(RADAR_DETECT_OP_START);
+			CALL_UMAC(uccp420wlan_prog_radar_detect,
+				  RADAR_DETECT_OP_START);
 		else
-			uccp420wlan_prog_radar_detect(RADAR_DETECT_OP_STOP);
+			CALL_UMAC(uccp420wlan_prog_radar_detect,
+				  RADAR_DETECT_OP_STOP);
 	}
+prog_umac_fail:
+	return;
 }
 
 
@@ -2533,12 +2588,12 @@ static int assign_vif_chanctx(struct ieee80211_hw *hw,
 	struct umac_vif *uvif = NULL;
 	struct umac_chanctx *ctx = NULL;
 	int prog_chanctx_time_info = 0;
-	int err = 0;
+	int ret = 0;
 
 	dev = hw->priv;
 	uvif = (struct umac_vif *)vif->drv_priv;
 	ctx = (struct umac_chanctx *)conf->drv_priv;
-	UCCP_DEBUG_TSMC("Got assign_vif_chanctx\n");
+	UCCP_DEBUG_80211IF("Got assign_vif_chanctx\n");
 
 	DEBUG_LOG("%s: addr: %pM, type: %d, p2p: %d chan: %d MHz\n",
 		  __func__,
@@ -2563,14 +2618,14 @@ static int assign_vif_chanctx(struct ieee80211_hw *hw,
 			dev->curr_chanctx_idx = ctx->index;
 
 		dev->num_active_chanctx++;
-		uccp420wlan_prog_chanctx_time_info();
+		CALL_UMAC(uccp420wlan_prog_chanctx_time_info);
 	}
 
-	err = umac_chanctx_set_channel(dev, uvif, &conf->def);
+	ret = umac_chanctx_set_channel(dev, uvif, &conf->def);
 
+prog_umac_fail:
 	mutex_unlock(&dev->mutex);
-
-	return err;
+	return ret;
 }
 
 
@@ -2582,13 +2637,13 @@ static void unassign_vif_chanctx(struct ieee80211_hw *hw,
 	struct umac_vif *uvif = NULL;
 	struct umac_chanctx *ctx = NULL;
 	u32 hw_queue_map = 0;
-	int i = 0;
+	int i = 0, ret = 0;
 
 	dev = hw->priv;
 	uvif = (struct umac_vif *)vif->drv_priv;
 	ctx = (struct umac_chanctx *)conf->drv_priv;
 
-	UCCP_DEBUG_TSMC("Got unassign_vif_chanctx\n");
+	UCCP_DEBUG_80211IF("Got unassign_vif_chanctx\n");
 
 	DEBUG_LOG("%s: addr: %pM, type: %d, p2p: %d chan: %d MHz\n",
 		  __func__,
@@ -2607,11 +2662,15 @@ static void unassign_vif_chanctx(struct ieee80211_hw *hw,
 		for (i = 0; i < NUM_ACS; i++)
 			hw_queue_map |= BIT(i);
 
+		ieee80211_stop_queues(hw);
 		uccp420_flush_vif_queues(dev,
 					 uvif,
 					 uvif->chanctx->index,
 					 hw_queue_map,
-					 UMAC_VIF_CHANCTX_TYPE_OPER);
+					 UMAC_VIF_CHANCTX_TYPE_OPER,
+					 TX_DROP);
+
+		ieee80211_wake_queues(hw);
 	}
 
 	uvif->chanctx = NULL;
@@ -2623,9 +2682,10 @@ static void unassign_vif_chanctx(struct ieee80211_hw *hw,
 		dev->num_active_chanctx--;
 
 		if (dev->num_active_chanctx)
-			uccp420wlan_prog_chanctx_time_info();
+			CALL_UMAC(uccp420wlan_prog_chanctx_time_info);
 	}
 
+prog_umac_fail:
 	mutex_unlock(&dev->mutex);
 }
 
@@ -2638,14 +2698,14 @@ static int switch_vif_chanctx(struct ieee80211_hw *hw,
 	struct mac80211_dev *dev = NULL;
 	int ret = 0;
 
-	UCCP_DEBUG_TSMC("Got switch_vif_chanctx\n");
+	UCCP_DEBUG_80211IF("Got switch_vif_chanctx\n");
 	dev = hw->priv;
 
 	/*TODO*/
 	if (n_vifs > 1)
 		return -EOPNOTSUPP;
 
-	pr_err("%s switch_vif_chanctx switch freq %hu->%hu width %d->%d\n",
+	UCCP_DEBUG_80211IF("%s switch freq %hu->%hu width %d->%d\n",
 		 __func__,
 		vifs[0].old_ctx->def.chan->center_freq,
 		vifs[0].new_ctx->def.chan->center_freq,
@@ -2707,7 +2767,8 @@ static void flush_queues(struct ieee80211_hw *hw,
 				 uvif,
 				 uvif->chanctx->index,
 				 hw_queue_map,
-				 UMAC_VIF_CHANCTX_TYPE_OPER);
+				 UMAC_VIF_CHANCTX_TYPE_OPER,
+				 drop ? TX_DROP : TX_FLUSH);
 
 out:
 	mutex_unlock(&dev->mutex);
@@ -2925,7 +2986,14 @@ static int proc_read_config(struct seq_file *m, void *v)
 	int cnt = 0;
 	int rf_params_size = sizeof(wifi->params.rf_params) /
 			     sizeof(wifi->params.rf_params[0]);
-	struct mac80211_dev *dev = ((struct mac80211_dev *)(wifi->hw->priv));
+	struct mac80211_dev *dev;
+	unsigned int nss, flags;
+	int mcs;
+
+	if (!wifi->hw)
+		return -ENODEV;
+
+	dev = ((struct mac80211_dev *)(wifi->hw->priv));
 
 	seq_puts(m, "************* Configurable Parameters ***********\n");
 	seq_printf(m, "dot11g_support = %d\n", wifi->params.dot11g_support);
@@ -2947,23 +3015,6 @@ static int proc_read_config(struct seq_file *m, void *v)
 
 	seq_printf(m, "production_test = %d\n", wifi->params.production_test);
 	seq_printf(m, "bypass_vpd = %d\n", wifi->params.bypass_vpd);
-	seq_printf(m, "tx_fixed_mcs_indx = %d (%s)\n",
-		   wifi->params.tx_fixed_mcs_indx,
-		   (wifi->params.prod_mode_rate_flag &
-		    ENABLE_VHT_FORMAT) ?
-		   "VHT" : (wifi->params.prod_mode_rate_flag &
-			    ENABLE_11N_FORMAT) ? "HT" : "Not Set");
-	if (wifi->params.tx_fixed_rate > -1) {
-		if (wifi->params.tx_fixed_rate == 55)
-			seq_puts(m, "tx_fixed_rate = 5.5\n");
-		else
-			seq_printf(m, "tx_fixed_rate = %d\n",
-				   wifi->params.tx_fixed_rate);
-	} else
-		seq_printf(m, "tx_fixed_rate = %d\n",
-			   wifi->params.tx_fixed_rate);
-	seq_printf(m, "num_spatial_streams (Per Frame) = %d\n",
-		   wifi->params.num_spatial_streams);
 	seq_printf(m, "uccp_num_spatial_streams (UCCP Init) = %d\n",
 		   wifi->params.uccp_num_spatial_streams);
 	seq_printf(m, "enable_early_agg_checks = %d\n",
@@ -2979,21 +3030,6 @@ static int proc_read_config(struct seq_file *m, void *v)
 		   wifi->params.disable_power_save);
 	seq_printf(m, "disable_sm_power_save (Disables MIMO PS only) = %d\n",
 		   wifi->params.disable_sm_power_save);
-	seq_printf(m, "mgd_mode_tx_fixed_mcs_indx = %d (%s)\n",
-		   wifi->params.mgd_mode_tx_fixed_mcs_indx,
-		   (wifi->params.prod_mode_rate_flag &
-		    ENABLE_VHT_FORMAT) ?
-		   "VHT" : (wifi->params.prod_mode_rate_flag &
-			    ENABLE_11N_FORMAT) ? "HT" : "Not Set");
-	if (wifi->params.mgd_mode_tx_fixed_rate > -1) {
-		if (wifi->params.mgd_mode_tx_fixed_rate == 55)
-			seq_puts(m, "mgd_mode_tx_fixed_rate = 5.5\n");
-		else
-			seq_printf(m, "mgd_mode_tx_fixed_rate = %d\n",
-				   wifi->params.mgd_mode_tx_fixed_rate);
-	} else
-		seq_printf(m, "mgd_mode_tx_fixed_rate = %d\n",
-			   wifi->params.mgd_mode_tx_fixed_rate);
 
 	seq_printf(m, "num_vifs = %d\n",
 		   wifi->params.num_vifs);
@@ -3019,6 +3055,43 @@ static int proc_read_config(struct seq_file *m, void *v)
 	}
 	seq_printf(m, "rate_protection_type = %d (0: Disable, 1: Enable)\n",
 		   wifi->params.rate_protection_type);
+	if (wifi->params.production_test) {
+		mcs = wifi->params.tx_fixed_mcs_indx;
+		flags = wifi->params.prod_mode_rate_flag;
+		seq_puts(m, "***Production Mode Rate config options\n");
+		seq_printf(m, "tx_fixed_mcs_indx = %d (%s)\n",
+			   mcs, get_string_from_rate(mcs, flags));
+		if (wifi->params.tx_fixed_rate > -1) {
+			if (wifi->params.tx_fixed_rate == 55)
+				seq_puts(m, "tx_fixed_rate = 5.5\n");
+			else
+				seq_printf(m, "tx_fixed_rate = %d\n",
+					   wifi->params.tx_fixed_rate);
+		} else
+			seq_printf(m, "tx_fixed_rate = %d\n",
+				   wifi->params.tx_fixed_rate);
+	} else {
+		seq_puts(m, "***Unicast Fixed rate config options\n");
+		mcs = wifi->params.mgd_mode_tx_fixed_mcs_indx;
+		flags = wifi->params.prod_mode_rate_flag;
+		seq_printf(m, "mgd_mode_tx_fixed_mcs_indx = %d (%s)\n",
+			   mcs, get_string_from_rate(mcs, flags));
+		if (wifi->params.mgd_mode_tx_fixed_rate > -1) {
+			if (wifi->params.mgd_mode_tx_fixed_rate == 55)
+				seq_puts(m, "mgd_mode_tx_fixed_rate = 5.5\n");
+			else
+				seq_printf(m, "mgd_mode_tx_fixed_rate = %d\n",
+					   wifi->params.mgd_mode_tx_fixed_rate);
+		} else
+			seq_printf(m, "mgd_mode_tx_fixed_rate = %d\n",
+				   wifi->params.mgd_mode_tx_fixed_rate);
+	}
+
+	if (wifi->params.prod_mode_rate_flag & ENABLE_11N_FORMAT)
+		nss = wifi->params.mgd_mode_tx_fixed_mcs_indx/8 + 1;
+	else
+		nss = wifi->params.num_spatial_streams;
+
 	seq_puts(m, "Bits:80MHz-VHT-11N-SGI-40MHz-GF\n");
 	seq_printf(m, "prod_mode_rate_flag = %d\n",
 		   wifi->params.prod_mode_rate_flag);
@@ -3028,6 +3101,36 @@ static int proc_read_config(struct seq_file *m, void *v)
 		   wifi->params.prod_mode_stbc_enabled);
 	seq_printf(m, "prod_mode_bcc_or_ldpc = %d\n",
 		   wifi->params.prod_mode_bcc_or_ldpc);
+	seq_printf(m, "num_spatial_streams = %d\n", nss);
+
+	seq_puts(m, "***Multicast Fixed rate config options\n");
+
+	mcs = wifi->params.mgd_mode_mcast_fixed_data_rate;
+	flags = wifi->params.mgd_mode_mcast_fixed_rate_flags;
+	if ((mcs != -1) && (mcs & 0x80))
+		mcs = mcs & 0x7F;
+
+	if (flags & ENABLE_11N_FORMAT)
+		nss = mcs/8 + 1;
+	else
+		nss = wifi->params.mgd_mode_mcast_fixed_nss;
+
+
+	seq_printf(m, "mgd_mode_mcast_fixed_data_rate = %d (%s)\n",
+		   mcs, get_string_from_rate(mcs, flags));
+
+	seq_puts(m, "Bits:80MHz-VHT-11N-SGI-40MHz-GF\n");
+	seq_printf(m, "mgd_mode_mcast_fixed_rate_flags = %d\n",
+		   wifi->params.mgd_mode_mcast_fixed_rate_flags);
+	seq_printf(m, "mgd_mode_mcast_fixed_bcc_or_ldpc = %d\n",
+		   wifi->params.mgd_mode_mcast_fixed_bcc_or_ldpc);
+	seq_printf(m, "mgd_mode_mcast_fixed_stbc_enabled = %d\n",
+		   wifi->params.mgd_mode_mcast_fixed_stbc_enabled);
+	seq_printf(m, "mgd_mode_mcast_fixed_preamble = %d\n",
+		   wifi->params.mgd_mode_mcast_fixed_preamble);
+	seq_printf(m, "mgd_mode_mcast_fixed_nss = %d\n", nss);
+	seq_puts(m, "***\n");
+
 	seq_printf(m, "vht_beamformer_enable = %d\n",
 		   wifi->params.vht_beamform_enable);
 	seq_printf(m, "vht_beamformer_period = %dms\n",
@@ -3152,13 +3255,13 @@ static int proc_read_config(struct seq_file *m, void *v)
 	if (uccp_debug & UCCP_DEBUG_TSMC)
 		seq_puts(m, "***uccp_debug: UCCP_DEBUG_TSMC Enabled\n");
 
-	seq_puts(m, "HELP: Add the values beside Module and\n");
+	seq_puts(m, "HELP: Add the values beside each module and\n");
 	seq_puts(m, " echo uccp_debug=<SUM> to enable logging\n");
 	seq_puts(m, " for those modules.\n");
-	seq_puts(m, "MODULE (Value): TSMC (4096), DUMP_HAL (1024), DUMP_RX (512),\n");
-	seq_puts(m, " CRYPTO(256), HAL(128), RX(64),\n");
-	seq_puts(m, " 80211IF(32), UMAC_IF(16), CORE(8),\n");
-	seq_puts(m, " TX(4), ROC(2), SCAN(1),\n");
+	seq_puts(m, " MODULE (Value): TSMC (4096), DUMP_HAL (2048), DUMP_RX (1024),\n");
+	seq_puts(m, " CRYPTO(512), HAL(256), RX(128),\n");
+	seq_puts(m, " 80211IF(64), UMAC_IF(32), CORE(16),\n");
+	seq_puts(m, " TX(8), ROC(4), SCAN(2),\n");
 
 	seq_puts(m, "To see the updated stats\n");
 	seq_puts(m, "please run: echo get_stats=1 > /proc/uccp420/params\n");
@@ -3360,6 +3463,11 @@ static int proc_read_mac_stats(struct seq_file *m, void *v)
 	int total_rssi_value = 0;
 	struct mac80211_dev *dev = NULL;
 
+	if (!wifi->hw)
+		return -ENODEV;
+
+	dev = (struct mac80211_dev *)(wifi->hw->priv);
+
 	if (ftm) {
 		for (index = 0; index < MAX_AUX_ADC_SAMPLES; index++) {
 			if (!wifi->params.pdout_voltage[index])
@@ -3471,7 +3579,6 @@ static int proc_read_mac_stats(struct seq_file *m, void *v)
 	seq_printf(m, "tx_done_recv_count = %d\n",
 		   wifi->stats.tx_done_recv_count);
 
-	dev = (struct mac80211_dev *)(wifi->hw->priv);
 	seq_printf(m, "tx_buff_pool_map = %ld\n",
 		   dev->tx.buf_pool_bmp[0]);
 	{
@@ -3480,6 +3587,7 @@ static int proc_read_mac_stats(struct seq_file *m, void *v)
 
 		seq_puts(m, "Pending Qs status\n");
 		for (i = 0; i < MAX_PEERS; i++) {
+
 			if (!dev->peers[i])
 				continue;
 
@@ -3487,7 +3595,8 @@ static int proc_read_mac_stats(struct seq_file *m, void *v)
 				spin_lock_bh(&dev->tx.lock);
 				pend_pkt_q = &dev->tx.pending_pkt[0][i][j];
 				if (skb_queue_len(pend_pkt_q))
-					seq_printf(m, "ac:%d peer:%d = %d\n",
+					seq_printf(m,
+						   "ac:%d peer:%d = %d\n",
 						   j,
 						   i,
 						   skb_queue_len(pend_pkt_q));
@@ -3588,10 +3697,13 @@ static ssize_t proc_write_config(struct file *file,
 	char buf[(RF_PARAMS_SIZE * 2) + 50];
 	unsigned long val;
 	long sval;
-	unsigned int rate = wifi->params.prod_mode_rate_flag;
-	unsigned int b40 = wifi->params.prod_mode_chnl_bw_40_mhz;
-	unsigned int b80 = wifi->params.prod_mode_chnl_bw_80_mhz;
-	struct mac80211_dev *dev = wifi->hw->priv;
+	struct mac80211_dev *dev;
+	int ret = 0;
+
+	if (!wifi->hw)
+		return -ENODEV;
+
+	dev = (struct mac80211_dev *)(wifi->hw->priv);
 
 	if (count >= sizeof(buf))
 		count = sizeof(buf) - 1;
@@ -3691,7 +3803,7 @@ static ssize_t proc_write_config(struct file *file,
 			pr_err("Interface is not initialized\n");
 			goto error;
 		}
-		uccp420wlan_prog_mib_stats();
+		CALL_UMAC(uccp420wlan_prog_mib_stats);
 	} else if (param_get_val(buf, "max_data_size=", &val)) {
 		if (wifi->params.max_data_size != val) {
 			if ((wifi->params.max_data_size >= 2 * 1024) &&
@@ -3776,65 +3888,40 @@ static ssize_t proc_write_config(struct file *file,
 			pr_err("Invalid parameter value, should be less than or equal to uccp_num_spatial_streams\n");
 	} else if (param_get_sval(buf, "mgd_mode_tx_fixed_mcs_indx=", &sval)) {
 		if (wifi->params.mgd_mode_tx_fixed_rate == -1) {
-
-			int mcs_indx = wifi->params.mgd_mode_tx_fixed_mcs_indx;
-
-			if (vht_support && (wifi->params.prod_mode_rate_flag &
-					    ENABLE_VHT_FORMAT)) {
-				if ((sval >= -1) && (sval <= 9)) {
-					/* Get_rate will do the MCS holes
-					 * validation
-					 */
-					mcs_indx = sval;
-				} else
-					pr_err("Invalid parameter value.\n");
-			} else {
-				if (wifi->params.num_spatial_streams == 2) {
-					if ((sval >= -1) && (sval <= 15))
-						mcs_indx = sval;
-					else
-						pr_err("Invalid MIMO HT MCS: %ld\n",
-						       sval);
-				}
-				if (wifi->params.num_spatial_streams == 1) {
-					if ((sval >= -1) && (sval <= 7))
-						mcs_indx = sval;
-					else
-						pr_err("Invalid SISO HT MCS: %ld\n",
-						       sval);
-				}
-			}
-
-			wifi->params.mgd_mode_tx_fixed_mcs_indx = mcs_indx;
+			if (check_valid_data_rate(dev, sval | 0x80, UCAST))
+				wifi->params.mgd_mode_tx_fixed_mcs_indx = sval;
 		} else
 			pr_err("Fixed rate other than MCS index is currently set\n");
 	} else if (param_get_sval(buf, "mgd_mode_tx_fixed_rate=", &sval)) {
 		if (wifi->params.mgd_mode_tx_fixed_mcs_indx == -1) {
-			int tx_fixed_rate = wifi->params.mgd_mode_tx_fixed_rate;
-
-			if (wifi->params.dot11g_support == 1 &&
-			    ((sval == 1) ||
-			     (sval == 2) ||
-			     (sval == 55) ||
-			     (sval == 11))) {
-				tx_fixed_rate = sval;
-			} else if ((sval == 6) ||
-				   (sval == 9) ||
-				   (sval == 12) ||
-				   (sval == 18) ||
-				   (sval == 24) ||
-				   (sval == 36) ||
-				   (sval == 48) ||
-				   (sval == 54) ||
-				   (sval == -1)) {
-				tx_fixed_rate = sval;
-			} else {
-				pr_err("Invalid parameter value.\n");
-				return count;
-			}
-			wifi->params.mgd_mode_tx_fixed_rate = tx_fixed_rate;
+			if (check_valid_data_rate(dev, sval, UCAST))
+				wifi->params.mgd_mode_tx_fixed_rate = sval;
 		} else
 			pr_err("MCS data rate(index) is currently set\n");
+	/* Multicast Rate configuration options.
+	 */
+	} else if (param_get_sval(buf, "mgd_mode_mcast_fixed_data_rate=",
+		   &sval)) {
+		if (check_valid_data_rate(dev, sval, MCAST))
+			wifi->params.mgd_mode_mcast_fixed_data_rate = sval;
+	} else if (param_get_val(buf, "mgd_mode_mcast_fixed_rate_flags=",
+		   &val)) {
+		if (check_valid_rate_flags(dev, val))
+			wifi->params.mgd_mode_mcast_fixed_rate_flags = val;
+	} else if (param_get_val(buf, "mgd_mode_mcast_fixed_bcc_or_ldpc=",
+		   &val)) {
+		wifi->params.mgd_mode_mcast_fixed_bcc_or_ldpc = val;
+	} else if (param_get_val(buf, "mgd_mode_mcast_fixed_stbc_enabled=",
+		   &val)) {
+		wifi->params.mgd_mode_mcast_fixed_stbc_enabled = val;
+	} else if (param_get_val(buf, "mgd_mode_mcast_fixed_preamble=",
+		   &val)) {
+		wifi->params.mgd_mode_mcast_fixed_preamble = val;
+	} else if (param_get_val(buf, "mgd_mode_mcast_fixed_nss=", &val)) {
+		wifi->params.mgd_mode_mcast_fixed_nss = val;
+
+	/* Production mode rate configuration
+	 */
 	} else if (param_get_sval(buf, "tx_fixed_mcs_indx=", &sval)) {
 		if (wifi->params.production_test != 1) {
 			pr_err("Only can be set in production mode.\n");
@@ -3850,32 +3937,10 @@ static ssize_t proc_write_config(struct file *file,
 			pr_err("Fixed rate other than MCS index is currently set\n");
 			goto error;
 		}
-		if (vht_support && (rate & ENABLE_VHT_FORMAT)) {
-			if ((sval >= -1) && (sval <= 9)) {
-				if ((b40 == 0) && (b80 == 0) && (sval == 9)) {
-					pr_err("Invalid VHT MCS: 20MHZ-MCS9.\n");
-					/*Reset to Default*/
-					wifi->params.tx_fixed_mcs_indx = 7;
-				} else
-					wifi->params.tx_fixed_mcs_indx = sval;
-			} else
-				pr_err("Invalid parameter value.\n");
-		} else if (vht_support && (rate & ENABLE_11N_FORMAT)) {
-			if (wifi->params.num_spatial_streams == 2) {
-				if ((sval >= -1) && (sval <= 15))
-					wifi->params.tx_fixed_mcs_indx = sval;
-				else
-					pr_err("Invalid MIMO HT MCS: %ld\n",
-						sval);
-			} else if (wifi->params.num_spatial_streams == 1) {
-				if ((sval >= -1) && (sval <= 7))
-					wifi->params.tx_fixed_mcs_indx = sval;
-				else
-					pr_err("Invalid SISO HT MCS: %ld\n",
-						sval);
-			}
-		} else
-			pr_err("MCS Setting is invalid for Legacy, please set prod_mode_rate_flag first.\n");
+
+		if (check_valid_data_rate(dev, sval | 0x80, UCAST))
+			wifi->params.tx_fixed_mcs_indx = sval;
+
 
 	} else if (param_get_sval(buf, "tx_fixed_rate=", &sval)) {
 		if (wifi->params.production_test != 1) {
@@ -3892,27 +3957,9 @@ static ssize_t proc_write_config(struct file *file,
 			goto error;
 		}
 
-		if ((wifi->params.dot11g_support == 1) &&
-			    ((sval == 1) ||
-			     (sval == 2) ||
-			     (sval == 55) ||
-			     (sval == 11))) {
-				wifi->params.tx_fixed_rate = sval;
-		} else if ((sval == 6) ||
-			   (sval == 9) ||
-			   (sval == 12) ||
-			   (sval == 18) ||
-			   (sval == 24) ||
-			   (sval == 36) ||
-			   (sval == 48) ||
-			   (sval == 54) ||
-			   (sval == -1)) {
-				wifi->params.tx_fixed_rate = sval;
-		} else {
-			pr_err("Invalid parameter value: tx_fixed_rate=%ld\n",
-				sval);
-			goto error;
-		}
+		if (check_valid_data_rate(dev, sval, UCAST))
+			wifi->params.tx_fixed_rate = sval;
+
 	} else if (param_get_val(buf, "chnl_bw=", &val)) {
 		if (((val == 0) ||
 		    (vht_support && (val == 2)) ||
@@ -4089,33 +4136,8 @@ static ssize_t proc_write_config(struct file *file,
 
 		} while (0);
 	} else if (param_get_val(buf, "prod_mode_rate_flag=", &val)) {
-		do {
-			/*Only first 6 flags are defined currently*/
-			if (val > 63)
-				pr_err("Invalid parameter value");
-
-			if ((val & ENABLE_VHT_FORMAT) &&
-			    (val & ENABLE_11N_FORMAT)) {
-				pr_err("Cannot set HT and VHT both.");
-				break;
-			}
-
-			if ((val & ENABLE_CHNL_WIDTH_40MHZ) &&
-			    (val & ENABLE_CHNL_WIDTH_80MHZ)) {
-				pr_err("Cannot set 40 and 80 both.");
-				break;
-			}
-
-			if ((wifi->params.uccp_num_spatial_streams == 1)  &&
-			    (val & ENABLE_SGI) &&
-			    (val & ENABLE_GREEN_FIELD)) {
-				pr_err("Cannot set GreenField when SGI is enabled for SISO");
-				break;
-			}
-
+		if (check_valid_rate_flags(dev, val))
 			wifi->params.prod_mode_rate_flag = val;
-		} while (0);
-
 	} else if (param_get_val(buf, "rate_protection_type=", &val)) {
 		/* 0 is None, 1 is RTS/CTS, 2 is for CTS2SELF */
 		if ((val == 0) || (val == 1) /*|| (val == 2)*/)
@@ -4179,7 +4201,9 @@ static ssize_t proc_write_config(struct file *file,
 				goto error;
 			}
 
-			uccp420wlan_prog_vht_bform(val, vht_beamform_period);
+			CALL_UMAC(uccp420wlan_prog_vht_bform,
+				  val,
+				  vht_beamform_period);
 		} while (0);
 
 	} else if (param_get_val(buf, "vht_beamformer_period=", &val)) {
@@ -4221,7 +4245,9 @@ static ssize_t proc_write_config(struct file *file,
 				goto error;
 			}
 
-			uccp420wlan_prog_vht_bform(vht_beamform_enable, val);
+			CALL_UMAC(uccp420wlan_prog_vht_bform,
+				  vht_beamform_enable,
+				  val);
 		} while (0);
 
 	} else if (param_get_val(buf, "bg_scan_enable=", &val)) {
@@ -4272,7 +4298,9 @@ static ssize_t proc_write_config(struct file *file,
 		if ((val == 1) || (val == 0)) {
 			wifi->params.nw_selection = val;
 			pr_err("in nw_selection\n");
-			uccp420wlan_prog_nw_selection(1, vif_macs[0]);
+			CALL_UMAC(uccp420wlan_prog_nw_selection,
+				  1,
+				  vif_macs[0]);
 		} else
 			pr_err("Invalid nw selection value should be 1 or 0\n");
 	} else if (param_get_val(buf, "scan_type=", &val)) {
@@ -4292,7 +4320,7 @@ static ssize_t proc_write_config(struct file *file,
 		       sizeof(char) * MAX_AUX_ADC_SAMPLES);
 		if ((val == AUX_ADC_CHAIN1) || (val == AUX_ADC_CHAIN2)) {
 			wifi->params.aux_adc_chain_id = val;
-			uccp420wlan_prog_aux_adc_chain(val);
+			CALL_UMAC(uccp420wlan_prog_aux_adc_chain, val);
 		} else
 			pr_err("Invalid chain id %d, should be %d or %d\n",
 			       (unsigned int) val,
@@ -4311,96 +4339,96 @@ static ssize_t proc_write_config(struct file *file,
 
 		if (val == 0 || val == 1) {
 			wifi->params.cont_tx = val;
-			uccp420wlan_prog_cont_tx(val);
+			CALL_UMAC(uccp420wlan_prog_cont_tx, val);
 		} else
 			pr_err("Invalid tx_continuous parameter\n");
 	} else if (param_get_val(buf, "start_prod_mode=", &val)) {
-			unsigned int pri_chnl_num = 0;
-			unsigned int freq_band = IEEE80211_BAND_5GHZ;
-			int center_freq = 0;
+		unsigned int pri_chnl_num = 0;
+		unsigned int freq_band = IEEE80211_BAND_5GHZ;
+		int center_freq = 0;
 
-			if (wifi->params.production_test != 1) {
-				pr_err("start_prod_mode: Can be set in only in production mode.\n");
-				goto error;
-			}
+		if (wifi->params.production_test != 1) {
+			pr_err("start_prod_mode: Can be set in only in production mode.\n");
+			goto error;
+		}
 
-			if (wifi->params.init_prod) {
-				pr_err("Production Test is already initialized.\n");
-				goto error;
-			}
+		if (wifi->params.init_prod) {
+			pr_err("Production Test is already initialized.\n");
+			goto error;
+		}
 
-			pri_chnl_num = val;
-			wifi->params.start_prod_mode = val;
-			tasklet_init(&dev->proc_tx_tasklet, packet_generation,
-				     (unsigned long)dev);
-			if (pri_chnl_num < 15)
-				freq_band = IEEE80211_BAND_2GHZ;
-			else
-				freq_band = IEEE80211_BAND_5GHZ;
+		pri_chnl_num = val;
+		wifi->params.start_prod_mode = val;
+		tasklet_init(&dev->proc_tx_tasklet, packet_generation,
+			     (unsigned long)dev);
+		if (pri_chnl_num < 15)
+			freq_band = IEEE80211_BAND_2GHZ;
+		else
+			freq_band = IEEE80211_BAND_5GHZ;
 
-			center_freq =
-			ieee80211_channel_to_frequency(pri_chnl_num,
-						       freq_band);
+		center_freq =
+		ieee80211_channel_to_frequency(pri_chnl_num,
+					       freq_band);
 
-			if ((wifi->params.fw_loading == 1) &&
-			     load_fw(dev->hw)) {
-				pr_err("%s: Firmware loading failed\n",
-				       dev->name);
-				goto error;
-			}
+		if ((wifi->params.fw_loading == 1) &&
+		     load_fw(dev->hw)) {
+			pr_err("%s: Firmware loading failed\n",
+			       dev->name);
+			goto error;
+		}
 
-			if (!uccp420wlan_core_init(dev, ftm)) {
-				uccp420wlan_prog_vif_ctrl(0,
-						dev->if_mac_addresses[0].addr,
-						IF_MODE_STA_IBSS,
-						IF_ADD);
+		if (!uccp420wlan_core_init(dev, ftm)) {
+			uccp420wlan_prog_vif_ctrl(0,
+					dev->if_mac_addresses[0].addr,
+					IF_MODE_STA_IBSS,
+					IF_ADD);
 
-				proc_bss_info_changed(
-						dev->if_mac_addresses[0].addr,
-						val);
+			proc_bss_info_changed(
+					dev->if_mac_addresses[0].addr,
+					val);
 
-				uccp420wlan_prog_channel(pri_chnl_num,
-							center_freq,
-							 0,
-							 0,
-					/*It will be overwritten anyway*/
+			uccp420wlan_prog_channel(pri_chnl_num,
+						center_freq,
+						 0,
+						 0,
+				/*It will be overwritten anyway*/
 #ifdef MULTI_CHAN_SUPPORT
-							 0,
+						 0,
 #endif
-							 freq_band);
-				skb_queue_head_init(&dev->tx.proc_tx_list[0]);
-				wifi->params.init_prod = 1;
-				dev->state = STARTED;
-				uccp_reinit = 0;
-			 } else {
-				pr_err("RPU Initialization Failed\n");
-				wifi->params.init_prod = 0;
-			}
+						 freq_band);
+			skb_queue_head_init(&dev->tx.proc_tx_list[0]);
+			wifi->params.init_prod = 1;
+			dev->state = STARTED;
+			uccp_reinit = 0;
+		 } else {
+			pr_err("RPU Initialization Failed\n");
+			wifi->params.init_prod = 0;
+		}
 
 	} else if (param_get_sval(buf, "stop_prod_mode=", &sval)) {
 
-			if (!wifi->params.init_prod) {
-				DEBUG_LOG("Prod mode is not initialized\n");
-				goto error;
-			}
+		if (!wifi->params.init_prod) {
+			DEBUG_LOG("Prod mode is not initialized\n");
+			goto error;
+		}
 
-			tasklet_kill(&dev->proc_tx_tasklet);
+		tasklet_kill(&dev->proc_tx_tasklet);
 #if 0
-			/* Todo: Enabling this causes RPU Lockup,
-			 * need to debug
-			 */
-			uccp420wlan_prog_vif_ctrl(0,
-						  dev->if_mac_addresses[0].addr,
-						  IF_MODE_STA_IBSS,
-						  IF_REM);
+		/* Todo: Enabling this causes RPU Lockup,
+		 * need to debug
+		 */
+		uccp420wlan_prog_vif_ctrl(0,
+					  dev->if_mac_addresses[0].addr,
+					  IF_MODE_STA_IBSS,
+					  IF_REM);
 #endif
-			if (!uccp_reinit)
-				stop(wifi->hw);
+		if (!uccp_reinit)
+			stop(wifi->hw);
 
-			wifi->params.start_prod_mode = 0;
-			wifi->params.pkt_gen_val = 1;
-			wifi->params.init_prod = 0;
-			wifi->params.init_pkt_gen = 0;
+		wifi->params.start_prod_mode = 0;
+		wifi->params.pkt_gen_val = 1;
+		wifi->params.init_prod = 0;
+		wifi->params.init_pkt_gen = 0;
 	} else if (param_get_sval(buf, "start_packet_gen=", &sval)) {
 
 
@@ -4452,7 +4480,7 @@ static ssize_t proc_write_config(struct file *file,
 		memset(wifi->params.pdout_voltage, 0,
 		       sizeof(char) * MAX_AUX_ADC_SAMPLES);
 		wifi->params.set_tx_power = sval;
-		uccp420wlan_prog_txpower(sval);
+		CALL_UMAC(uccp420wlan_prog_txpower, sval);
 #ifdef PERF_PROFILING
 	} else if (param_get_val(buf, "driver_tput=", &val)) {
 		if ((val == 1) || (val == 0))
@@ -4461,7 +4489,7 @@ static ssize_t proc_write_config(struct file *file,
 			pr_err("Invalid driver_tput value should be 1 or 0\n");
 #endif
 	} else if (param_get_val(buf, "fw_loading=", &val)) {
-			wifi->params.fw_loading = val;
+		wifi->params.fw_loading = val;
 	} else if (param_get_val(buf, "bt_state=", &val)) {
 		if (dev->state != STARTED) {
 			pr_err("Interface is not initialized\n");
@@ -4471,7 +4499,7 @@ static ssize_t proc_write_config(struct file *file,
 		if (val == 0 || val == 1) {
 			if (val != wifi->params.bt_state) {
 				wifi->params.bt_state = val;
-				uccp420wlan_prog_btinfo(val);
+				CALL_UMAC(uccp420wlan_prog_btinfo, val);
 			}
 		} else
 			pr_err("Invalid parameter value: Allowed values: 0 or 1\n");
@@ -4480,7 +4508,7 @@ static ssize_t proc_write_config(struct file *file,
 			pr_err("Interface is not initialized\n");
 			goto error;
 		}
-		uccp420wlan_prog_clear_stats();
+		CALL_UMAC(uccp420wlan_prog_clear_stats);
 	} else if (param_get_val(buf, "disable_beacon_ibss=", &val)) {
 		if ((val == 1) || (val == 0))
 			wifi->params.disable_beacon_ibss = val;
@@ -4499,6 +4527,8 @@ static ssize_t proc_write_config(struct file *file,
 		pr_err("Invalid parameter name: %s\n", buf);
 error:
 	return count;
+prog_umac_fail:
+	return ret;
 }
 
 
@@ -4623,8 +4653,16 @@ static int proc_init(struct proc_dir_entry ***main_dir_entry)
 
 	wifi->params.enable_early_agg_checks = 1;
 	wifi->params.bt_state = 1;
+
+	/* Defaults optimized for all IMG clients
+	 */
 	wifi->params.mgd_mode_tx_fixed_mcs_indx = -1;
+	wifi->params.mgd_mode_mcast_fixed_data_rate = -1;
 	wifi->params.mgd_mode_tx_fixed_rate = -1;
+	wifi->params.mgd_mode_mcast_fixed_nss = 1;
+	wifi->params.mgd_mode_mcast_fixed_bcc_or_ldpc = 1;
+	wifi->params.mgd_mode_mcast_fixed_stbc_enabled = 1;
+
 	if (vht_support)
 		wifi->params.chnl_bw = WLAN_80MHZ_OPERATION;
 	else

@@ -26,25 +26,25 @@
 #ifndef _UCCP420WLAN_CORE_H_
 #define _UCCP420WLAN_CORE_H_
 
-#include <linux/version.h>
-#include <linux/spinlock.h>
-#include <linux/skbuff.h>
-#include <linux/timer.h>
+#include <linux/atomic.h>
 #include <linux/delay.h>
-#include <linux/wireless.h>
-#include <linux/sched.h>
-#include <linux/jiffies.h>
-
+#include <linux/dma-mapping.h>
+#include <linux/etherdevice.h>
 #include <linux/interrupt.h>
+#include <linux/jiffies.h>
+#include <linux/sched.h>
+#include <linux/skbuff.h>
+#include <linux/spinlock.h>
+#include <linux/timer.h>
+#include <linux/version.h>
+#include <linux/wireless.h>
+
 #include <net/mac80211.h>
 
-#include <linux/dma-mapping.h>
-#include <linux/atomic.h>
-#include <linux/etherdevice.h>
 
+#include "descriptors.h"
 #include "host_umac_if.h"
 #include "umac_if.h"
-#include "descriptors.h"
 
 extern unsigned int vht_support;
 extern struct cmd_send_recv_cnt cmd_info;
@@ -56,28 +56,38 @@ extern unsigned char rx_interrupt_status;
 #endif
 
 
-#define UCCP_DEBUG_TX(fmt, ...)				    \
-do {                                                                    \
-		if (uccp_debug & UCCP_DEBUG_TX)		                \
-			pr_debug(fmt, ##__VA_ARGS__);  \
+#define UCCP_DEBUG_TX(fmt, ...)			\
+do {                                             \
+	if (uccp_debug & UCCP_DEBUG_TX)		  \
+		pr_debug(fmt, ##__VA_ARGS__);      \
 } while (0)
 
-#define UCCP_DEBUG_SCAN(fmt, ...)                           \
-do {                                                                    \
-		if (uccp_debug & UCCP_DEBUG_SCAN)                       \
-			pr_debug(fmt, ##__VA_ARGS__);  \
+#define UCCP_DEBUG_SCAN(fmt, ...)            \
+do {                                          \
+	if (uccp_debug & UCCP_DEBUG_SCAN)      \
+		pr_debug(fmt, ##__VA_ARGS__);   \
 } while (0)
 
-#define UCCP_DEBUG_ROC(fmt, ...)                           \
-do {                                                                    \
-		if (uccp_debug & UCCP_DEBUG_ROC)			\
-			pr_debug(fmt, ##__VA_ARGS__);  \
+#define UCCP_DEBUG_ROC(fmt, ...)            \
+do {                                         \
+	if (uccp_debug & UCCP_DEBUG_ROC)      \
+		pr_debug(fmt, ##__VA_ARGS__);  \
 } while (0)
 
-#define UCCP_DEBUG_TSMC(fmt, ...)                           \
-do {                                                                    \
-		if (uccp_debug & UCCP_DEBUG_TSMC)                       \
-			pr_debug(fmt, ##__VA_ARGS__);  \
+#define UCCP_DEBUG_TSMC(fmt, ...)             \
+do {                                           \
+	if (uccp_debug & UCCP_DEBUG_TSMC)       \
+		pr_debug(fmt, ##__VA_ARGS__);    \
+} while (0)
+
+/* Wrapper to check return values for all
+ * umac_if layer calls.
+ */
+#define CALL_UMAC(prog_umac, ...) \
+do {                            \
+	ret = prog_umac(__VA_ARGS__);   \
+	if (ret != 0)                    \
+		goto prog_umac_fail;      \
 } while (0)
 
 #ifdef CONFIG_NL80211_TESTMODE
@@ -136,6 +146,9 @@ extern spinlock_t tsf_lock;
 #define QUEUE_FLUSH_TIMEOUT  2000   /* Specify delay in milli-seconds*/
 #define QUEUE_FLUSH_TIMEOUT_TICKS   msecs_to_jiffies(QUEUE_FLUSH_TIMEOUT)
 
+#define TX_DEINIT_TIMEOUT 5000
+#define TX_DEINIT_TIMEOUT_TICKS msecs_to_jiffies(TX_DEINIT_TIMEOUT)
+
 #ifdef CONFIG_PM
 #define PS_ECON_CFG_TIMEOUT 1000
 #define PS_ECON_CFG_TIMEOUT_TICKS msecs_to_jiffies(PS_ECON_CFG_TIMEOUT)
@@ -173,11 +186,20 @@ extern spinlock_t tsf_lock;
 #define BTS_AP_24GHZ_ETS 195 /* Microsecs */
 #define BTS_AP_5GHZ_ETS 25 /* Microsecs */
 
+enum ptype {
+	UCAST = 0,
+	MCAST
+};
 
 enum noa_triggers {
 	FROM_TX = 0,
 	FROM_TX_DONE,
 	FROM_EVENT_NOA
+};
+
+enum tx_deinit {
+	TX_FLUSH = 0,
+	TX_DROP,
 };
 
 enum uccp420_hw_scan_status {
@@ -186,18 +208,18 @@ enum uccp420_hw_scan_status {
 };
 
 enum uccp_debug {
-	UCCP_DEBUG_SCAN			= BIT(0),
-	UCCP_DEBUG_ROC			= BIT(1),
-	UCCP_DEBUG_TX			= BIT(2),
-	UCCP_DEBUG_CORE			= BIT(3),
-	UCCP_DEBUG_IF			= BIT(4),
-	UCCP_DEBUG_80211IF		= BIT(5),
-	UCCP_DEBUG_RX			= BIT(6),
-	UCCP_DEBUG_HAL			= BIT(7),
-	UCCP_DEBUG_CRYPTO		= BIT(8),
-	UCCP_DEBUG_DUMP_RX		= BIT(9),
-	UCCP_DEBUG_DUMP_HAL		= BIT(10),
-	UCCP_DEBUG_TSMC			= BIT(11),
+	UCCP_DEBUG_SCAN			= BIT(1),
+	UCCP_DEBUG_ROC			= BIT(2),
+	UCCP_DEBUG_TX			= BIT(3),
+	UCCP_DEBUG_CORE			= BIT(4),
+	UCCP_DEBUG_IF			= BIT(5),
+	UCCP_DEBUG_80211IF		= BIT(6),
+	UCCP_DEBUG_RX			= BIT(7),
+	UCCP_DEBUG_HAL			= BIT(8),
+	UCCP_DEBUG_CRYPTO		= BIT(9),
+	UCCP_DEBUG_DUMP_RX		= BIT(10),
+	UCCP_DEBUG_DUMP_HAL		= BIT(11),
+	UCCP_DEBUG_TSMC			= BIT(12),
 };
 
 struct wifi_sync {
@@ -226,7 +248,6 @@ struct wifi_params {
 	/*RF Params: Input to the RF for operation*/
 	unsigned char  rf_params[RF_PARAMS_SIZE];
 	unsigned char  rf_params_vpd[RF_PARAMS_SIZE];
-	/*Calibration Params: Input for different calibrations in RF*/
 	unsigned char production_test;
 	unsigned int dot11a_support;
 	unsigned int dot11g_support;
@@ -234,6 +255,16 @@ struct wifi_params {
 	unsigned int prod_mode_chnl_bw_40_mhz;
 	unsigned int sec_ch_offset_40_plus;
 	unsigned int sec_ch_offset_40_minus;
+
+	/*Multicast  Rate config options*/
+	unsigned int mgd_mode_mcast_fixed_rate_flags;
+	int mgd_mode_mcast_fixed_data_rate;
+	unsigned int mgd_mode_mcast_fixed_bcc_or_ldpc;
+	unsigned int mgd_mode_mcast_fixed_stbc_enabled;
+	unsigned int mgd_mode_mcast_fixed_preamble;
+	unsigned char mgd_mode_mcast_fixed_nss;
+	/*End*/
+
 	unsigned int prod_mode_rate_flag;
 	unsigned int prod_mode_rate_preamble_type;
 	unsigned int prod_mode_stbc_enabled;
@@ -495,6 +526,7 @@ struct tx_pkt_info {
 	unsigned int curr_retries;
 	unsigned int max_retries;
 	int roc_peer_id;
+	int peer_id;
 	bool adjusted_rates;
 };
 
@@ -620,6 +652,7 @@ struct mac80211_dev {
 	char cancel_roc;
 	char chan_prog_done;
 	char reset_complete;
+	char tx_deinit_complete;
 	int power_save; /* Will be set only when a single VIF in
 			 * STA mode is active
 			 */
@@ -718,6 +751,7 @@ extern int wait_for_scan_abort(struct mac80211_dev *dev);
 extern int wait_for_channel_prog_complete(struct mac80211_dev *dev);
 extern int wait_for_tx_queue_flush_complete(struct mac80211_dev *dev,
 					    unsigned int token);
+int wait_for_tx_deinit_complete(struct mac80211_dev *dev);
 extern int uccp420wlan_prog_nw_selection(unsigned int nw_select_enabled,
 					 unsigned char *mac_addr);
 extern int  uccp420wlan_core_init(struct mac80211_dev *dev, unsigned int ftm);
@@ -774,8 +808,19 @@ int uccp420_flush_vif_queues(struct mac80211_dev *dev,
 			     struct umac_vif *uvif,
 			     int chanctx_idx,
 			     unsigned int hw_queue_map,
-			     enum UMAC_VIF_CHANCTX_TYPE vif_chanctx_type);
+			     enum UMAC_VIF_CHANCTX_TYPE vif_chanctx_type,
+			     bool drop);
 
+int uccp420_discard_sta_pend_q(struct mac80211_dev *dev,
+				   struct umac_vif *uvif,
+				   int peer_id,
+				   unsigned int hw_queue_map);
+
+int uccp420_discard_sta_tx_q(struct mac80211_dev *dev,
+				   struct umac_vif *uvif,
+				   int peer_id,
+				   unsigned int hw_queue_map,
+				   int chanctx_idx);
 /* Beacon TimeStamp */
 __s32 __attribute__((weak)) frc_to_atu(__u32 frccnt, __u64 *patu, s32 dir);
 int __attribute__((weak)) get_evt_timer_freq(unsigned int *mask,
@@ -842,6 +887,129 @@ static __always_inline long param_get_match(unsigned char *buf,
 		return 1;
 	else
 		return 0;
+}
+
+static __always_inline char *get_string_from_rate(int rate,
+						   unsigned int flags)
+{
+	if (rate == -1)
+		return "Disabled";
+
+	if (flags & ENABLE_VHT_FORMAT)
+		return "VHT";
+
+	if (flags & ENABLE_11N_FORMAT)
+		return "HT";
+
+	return "Legacy";
+}
+
+static __always_inline bool check_valid_rate_flags(struct mac80211_dev *dev,
+						   unsigned long val)
+{
+	bool ret = false;
+
+	do {
+		/*Only first 6 flags are defined currently*/
+		if (val > 63) {
+			pr_err("Invalid parameter value");
+			break;
+		}
+
+		if ((val & ENABLE_VHT_FORMAT) &&
+		    (val & ENABLE_11N_FORMAT)) {
+			pr_err("Cannot set HT and VHT both.");
+			break;
+		}
+
+		if ((val & ENABLE_CHNL_WIDTH_40MHZ) &&
+		    (val & ENABLE_CHNL_WIDTH_80MHZ)) {
+			pr_err("Cannot set 40 and 80 both.");
+			break;
+		}
+
+		if ((dev->params->uccp_num_spatial_streams == 1)  &&
+		    (val & ENABLE_SGI) &&
+		    (val & ENABLE_GREEN_FIELD)) {
+			pr_err("Cannot set GreenField when SGI is enabled for SISO");
+			break;
+		}
+		ret = true;
+	} while (0);
+
+	return ret;
+}
+
+static __always_inline bool check_valid_data_rate(struct mac80211_dev *dev,
+						  int dr,
+						  enum ptype type)
+{
+	bool is_mcs = dr & 0x80;
+	bool ret = false;
+	unsigned int rate;
+	unsigned int nss;
+
+	if (type == UCAST) {
+		rate = dev->params->prod_mode_rate_flag;
+		nss  = dev->params->num_spatial_streams;
+	} else {
+		rate = dev->params->mgd_mode_mcast_fixed_rate_flags;
+		nss  = dev->params->mgd_mode_mcast_fixed_nss;
+	}
+
+	if (dr == -1)
+		return true;
+
+	if (is_mcs) {
+		dr = dr & 0x7F;
+		if (vht_support && (rate &
+				    ENABLE_VHT_FORMAT)) {
+			if ((dr >= 0 && dr <= 9))
+				ret = true;
+			else
+				pr_err("Invalid VHT MCS value: %d\n", dr);
+		} else if (rate & ENABLE_11N_FORMAT) {
+			if (nss == 2) {
+				if ((dr >= 8) && (dr <= 15))
+					ret = true;
+				else
+					pr_err("Invalid MIMO HT MCS: %d\n",
+					       dr);
+			}
+			if (nss == 1) {
+				if ((dr >= 0) && (dr <= 7))
+					ret = true;
+				else
+					pr_err("Invalid SISO HT MCS: %d\n",
+					       dr);
+			}
+		}
+
+	} else {
+		if (dev->params->dot11g_support == 1 &&
+		    ((dr == 1) ||
+		     (dr == 2) ||
+		     (dr == 55) ||
+		     (dr == 11))) {
+			ret = true;
+		} else if ((dr == 6) ||
+			   (dr == 9) ||
+			   (dr == 12) ||
+			   (dr == 18) ||
+			   (dr == 24) ||
+			   (dr == 36) ||
+			   (dr == 48) ||
+			   (dr == 54) ||
+			   (dr == -1)) {
+			ret = true;
+		} else
+			pr_err("Invalid Legacy Rate value: %d\n", dr);
+		if ((rate & ENABLE_11N_FORMAT) || (rate & ENABLE_VHT_FORMAT)) {
+			ret = false;
+			pr_err("Invalid rate_flags for legacy: %d\n", dr);
+		}
+	}
+	return ret;
 }
 
 static inline int vif_addr_to_index(unsigned char *addr,

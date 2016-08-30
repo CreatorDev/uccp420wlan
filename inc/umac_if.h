@@ -29,7 +29,9 @@
 
 #ifndef _UCCP420WLAN_UMAC_IF_H_
 #define _UCCP420WLAN_UMAC_IF_H_
+
 #include <linux/skbuff.h>
+
 #include "hal.h"
 #include "host_umac_if.h"
 
@@ -300,6 +302,7 @@ extern void uccp420_lmac_if_free_outstnding(void);
 extern int uccp420wlan_prog_chanctx_time_info(void);
 #endif
 
+extern int uccp420wlan_prog_tx_deinit(int vif_index, char *peer_addr);
 #endif /* _UCCP420WLAN_UMAC_IF_H_ */
 
 /* EOF */

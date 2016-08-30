@@ -22,24 +22,24 @@
  * USA.
  */
 
-#include <linux/spinlock.h>
+#include <linux/netdevice.h>
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
-#include <linux/netdevice.h>
+#include <linux/spinlock.h>
 
-#include "umac_if.h"
 #include "core.h"
+#include "umac_if.h"
 
-#define UCCP_DEBUG_IF(fmt, ...)                           \
-do {                                                                    \
-		if (uccp_debug & UCCP_DEBUG_IF)                       \
-			pr_debug(fmt, ##__VA_ARGS__);  \
+#define UCCP_DEBUG_IF(fmt, ...)              \
+do {                                          \
+	if (uccp_debug & UCCP_DEBUG_IF)        \
+		pr_debug(fmt, ##__VA_ARGS__);   \
 } while (0)
 
-#define UCCP_DEBUG_FAIL_SAFE(fmt, ...)                           \
-do {                                                                    \
-		if (uccp_debug & UCCP_DEBUG_FAIL_SAFE)                       \
-			pr_debug(fmt, ##__VA_ARGS__);  \
+#define UCCP_DEBUG_FAIL_SAFE(fmt, ...)        \
+do {                                           \
+	if (uccp_debug & UCCP_DEBUG_FAIL_SAFE)  \
+		pr_debug(fmt, ##__VA_ARGS__);    \
 } while (0)
 
 unsigned char wildcard_ssid[7] = "DIRECT-";
@@ -159,32 +159,34 @@ static void get_rate(struct sk_buff *skb,
 		     struct mac80211_dev *dev)
 {
 	struct ieee80211_rate *rate;
-	struct ieee80211_tx_info *c;
-	unsigned int index;
+	struct ieee80211_tx_info *c = IEEE80211_SKB_CB(skb);
+	unsigned int index, min_rate;
 	bool is_mcs = false, is_mgd = false;
 	struct ieee80211_tx_rate *txrate;
 	unsigned char mcs_rate_num = 0;
 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *) skb->data;
 	int mcs_indx;
 	int mgd_rate;
+	int mgd_mcast_rate;
 	int prot_type;
-
+	unsigned char nss = 1;
+	bool all_rates_invalid = true;
 	/* Normal Mode*/
-	rate = ieee80211_get_tx_rate(dev->hw, IEEE80211_SKB_CB(skb));
+	rate = ieee80211_get_tx_rate(dev->hw, c);
+	min_rate = dev->hw->wiphy->bands[c->band]->bitrates[0].hw_value;
 
 	if (rate == NULL) {
-		rate = &dev->hw->wiphy->bands[
-				dev->hw->conf.chandef.chan->band]->bitrates[0];
 		txcmd->num_rates = 1;
-		txcmd->rate[0] = rate->hw_value;
+		txcmd->rate[0] = min_rate;
 		txcmd->rate_retries[0] = 5;
 		txcmd->rate_protection_type[0] = USE_PROTECTION_NONE;
 		txcmd->rate_preamble_type[0] = DONT_USE_SHORT_PREAMBLE;
-
+		txcmd->num_spatial_streams[0] = 1;
+		txcmd->bcc_or_ldpc = 0;
+		txcmd->stbc_enabled = 0;
 		return;
 	}
 
-	c = IEEE80211_SKB_CB(skb);
 	/* Some defaults*/
 	txcmd->num_rates = 0;
 	txcmd->stbc_enabled = 0;
@@ -201,12 +203,15 @@ static void get_rate(struct sk_buff *skb,
 	}
 
 	for (index = 0; index < 4; index++) {
+		bool skip_rate = false;
+
 		txrate = (&c->control.rates[index]);
 		txcmd->rate_flags[index] = 0;
 
 		if (txrate->idx < 0)
 			continue;
 
+		txcmd->num_rates++;
 		txcmd->num_spatial_streams[index] = 1;
 
 		/* production test*/
@@ -257,84 +262,79 @@ static void get_rate(struct sk_buff *skb,
 		 */
 
 		/* It is an VHT MCS rate */
-		if (((txrate->flags & IEEE80211_TX_RC_MCS) ||
-		     (txrate->flags & IEEE80211_TX_RC_VHT_MCS)) &&
-		    txrate->flags & IEEE80211_TX_RC_VHT_MCS) {
+		if (txrate->flags & IEEE80211_TX_RC_VHT_MCS) {
 			/*idx field is split
 			 * into a higher 4 bits (Nss), starts
 			 * with 0 and lower 4 bits (MCS number)
 			 */
 			is_mcs = true;
-			mcs_rate_num = (txrate->idx & 0x0F);
-			txcmd->num_spatial_streams[index] =
-				((txrate->idx & 0xF0) >> 4) + 1;
-			/* STBC Enabled/Disabled: valid Nss = 1 */
-			if (txcmd->num_spatial_streams[index] == 1 &&
-			    (c->flags & IEEE80211_TX_CTL_STBC))
-				txcmd->stbc_enabled = 1;
-
-		} else if (((txrate->flags & IEEE80211_TX_RC_MCS) ||
-			    (txrate->flags & IEEE80211_TX_RC_VHT_MCS)) &&
-			   txrate->flags & IEEE80211_TX_RC_MCS) { /*HT rate */
+			mcs_rate_num = ieee80211_rate_get_vht_mcs(txrate);
+			nss =  ieee80211_rate_get_vht_nss(txrate);
+			txcmd->rate_flags[index] |= ENABLE_VHT_FORMAT;
+		} else if (txrate->flags & IEEE80211_TX_RC_MCS) {
 			is_mcs = true;
 			mcs_rate_num  = txrate->idx;
-
-			/* Update No of Spatial streams*/
-			if (mcs_rate_num < 8) {
-				txcmd->num_spatial_streams[index] = 1;
-			} else if (mcs_rate_num > 7  &&
-				 mcs_rate_num < 16) {
-				txcmd->num_spatial_streams[index] = 2;
-			} else  {
-				pr_err("UCCP420_WIFI: Invalid MCS index: %d, Supports only 2 spatial streams\n",
-			       mcs_rate_num);
-			}
-
-			/* Ensures good throughput */
-			if (mcs_rate_num > 15 &&
-			    dev->params->uccp_num_spatial_streams == 1) {
-				mcs_rate_num = 7;
-				txcmd->num_spatial_streams[index] = 1;
-			} else if (mcs_rate_num > 15 &&
-				   dev->params->uccp_num_spatial_streams == 2) {
-				mcs_rate_num = 15;
-				txcmd->num_spatial_streams[index] = 2;
-			}
-
-			/* STBC Enabled/Disabled: valid for Nss=1 */
-			if (mcs_rate_num < 8 &&
-			    (c->flags & IEEE80211_TX_CTL_STBC))
-				txcmd->stbc_enabled = 1;
-
-		} else if (((txrate->flags & IEEE80211_TX_RC_MCS) ||
-			    (txrate->flags & IEEE80211_TX_RC_VHT_MCS))) {
-			is_mcs = true;
-			WARN_ON(1);
-		}
-
-		/* Rate FORMAT*/
-		if (txrate->flags & IEEE80211_TX_RC_VHT_MCS)
-			txcmd->rate_flags[index] |= ENABLE_VHT_FORMAT;
-		else if (txrate->flags & IEEE80211_TX_RC_MCS)
+			nss = mcs_rate_num/8 + 1;
 			txcmd->rate_flags[index] |= ENABLE_11N_FORMAT;
+		}
 
 		mcs_indx = dev->params->mgd_mode_tx_fixed_mcs_indx;
 		mgd_rate = dev->params->mgd_mode_tx_fixed_rate;
+		mgd_mcast_rate = dev->params->mgd_mode_mcast_fixed_data_rate;
 
 		/* Rate Index:
-		 * From proc (only for data packets)
+		 * From proc:
+		 *    ** Multicast data packets
+		 *    ** Unicast data packets
 		 * From RC in mac80211
 		 * Can be MCS(HT/VHT) or Rate (11abg)
 		 */
-		if (ieee80211_is_data(hdr->frame_control) && mcs_indx != -1) {
+		if (ieee80211_is_data(hdr->frame_control) &&
+		    is_multicast_ether_addr(hdr->addr1) &&
+		    (mgd_mcast_rate != -1)) {
+			/* proc: Fixed MCS/Legacy rate for Multicast packets
+			 */
+			is_mgd = true;
+			is_mcs = (mgd_mcast_rate & 0x80) == 0x80 ? true : false;
+
+			if (!is_mcs) {
+				if (mgd_mcast_rate == 55)
+					mgd_mcast_rate = 11;
+				else
+					mgd_mcast_rate *= 2;
+			}
+
+			txcmd->rate[index] = mgd_mcast_rate;
+			txcmd->rate_flags[index] =
+				dev->params->mgd_mode_mcast_fixed_rate_flags;
+			txcmd->bcc_or_ldpc =
+				dev->params->mgd_mode_mcast_fixed_bcc_or_ldpc;
+			if (txcmd->rate_flags[index] & ENABLE_11N_FORMAT)
+				nss = (mgd_mcast_rate & 0x7F)/8 + 1;
+			else
+				nss = dev->params->mgd_mode_mcast_fixed_nss;
+			txcmd->stbc_enabled =
+				dev->params->mgd_mode_mcast_fixed_stbc_enabled;
+			txcmd->rate_preamble_type[index] =
+				dev->params->mgd_mode_mcast_fixed_preamble;
+			if (is_mcs)
+				update_mcs_packet_stat(mgd_mcast_rate & 0x7F,
+						       txcmd->rate_flags[index],
+						       dev);
+		} else if (ieee80211_is_data(hdr->frame_control) &&
+			   mcs_indx != -1) {
+			/* proc: Fixed MCS for unicast
+			 */
 			is_mgd = true;
 
 			txcmd->rate[index] = 0x80;
 			txcmd->rate[index] |= (mcs_indx);
 			txcmd->rate_flags[index] =
 				dev->params->prod_mode_rate_flag;
-			txcmd->num_spatial_streams[index] =
-				dev->params->num_spatial_streams;
+			if (txcmd->rate_flags[index] & ENABLE_11N_FORMAT)
+				nss = (mcs_indx)/8 + 1;
+			else
+				nss = dev->params->num_spatial_streams;
 			txcmd->bcc_or_ldpc =
 				dev->params->prod_mode_bcc_or_ldpc;
 			txcmd->stbc_enabled =
@@ -345,6 +345,8 @@ static void get_rate(struct sk_buff *skb,
 					       dev);
 		} else if (ieee80211_is_data(hdr->frame_control) &&
 			   mgd_rate != -1) {
+			/* proc: Fixed Legacy Rate for unicast
+			 */
 			is_mgd = true;
 			txcmd->rate[index] = 0x80;
 			txcmd->rate[index] = 0x00;
@@ -355,34 +357,51 @@ static void get_rate(struct sk_buff *skb,
 				txcmd->rate[index] |= ((mgd_rate * 10) / 5);
 
 			txcmd->rate_flags[index] = 0;
-			txcmd->num_spatial_streams[index]  = 1;
+			nss = 1;
 			txcmd->bcc_or_ldpc         = 0;
 			txcmd->stbc_enabled        = 0;
-		} else if (is_mcs) { /* idx is MCS */
-			/* Now mark MSB to tell LMAC that it is a MCS Index */
-			txcmd->rate[index] = 0x80;
+			txcmd->rate_preamble_type[index] =
+				dev->params->prod_mode_rate_preamble_type;
+		} else if (is_mcs) {
+			txcmd->rate[index] = MARK_RATE_AS_MCS_INDEX;
 			txcmd->rate[index] |= mcs_rate_num;
 			update_mcs_packet_stat(mcs_rate_num,
 					      txcmd->rate_flags[index],
 					      dev);
-		} else if (!is_mcs) { /* idx is RATE...*/
+		} else if (!is_mcs) {
 			rate = &dev->hw->wiphy->bands[
 				c->band]->bitrates[
 				c->control.rates[index].idx];
-			/* Now mark MSB to tell LMAC that it is a rate*/
-			txcmd->rate[index] = 0x00;
+			txcmd->rate[index] = MARK_RATE_AS_RATE;
 			txcmd->rate[index] |= rate->hw_value;
-			/* using rate so 11g/11b/11a */
-			txcmd->num_spatial_streams[index] = 1;
+			nss = 1;
 		}
 
-		if (txcmd->rate_flags[index] & ENABLE_VHT_FORMAT) {
+		txcmd->num_spatial_streams[index] = nss;
+		if (txcmd->rate_flags[index] & ENABLE_VHT_FORMAT)
 			/*Enabled for all ucast/bcast/mcast frames*/
 			txcmd->aggregate_mpdu = AMPDU_AGGR_ENABLED;
+
+		if (is_mgd) {
+			if (dev->params->rate_protection_type)
+				txcmd->rate_protection_type[index] =
+					USE_PROTECTION_RTS;
+			else
+				txcmd->rate_protection_type[index] =
+					USE_PROTECTION_NONE;
+			txcmd->rate_retries[index] = 1;
+			all_rates_invalid = false;
+			break;
 		}
+
+		/* STBC Enabled/Disabled: valid if n_antennas > Nss */
+		if (dev->params->uccp_num_spatial_streams > nss &&
+		    (c->flags & IEEE80211_TX_CTL_STBC))
+			txcmd->stbc_enabled = 1;
 
 		txcmd->rate_retries[index] =
 			c->control.rates[index].count;
+
 		if (c->control.rates[index].flags &
 		    IEEE80211_TX_RC_USE_SHORT_PREAMBLE)
 			txcmd->rate_preamble_type[index] =
@@ -392,7 +411,6 @@ static void get_rate(struct sk_buff *skb,
 				DONT_USE_SHORT_PREAMBLE;
 
 		prot_type = USE_PROTECTION_NONE;
-
 		if (dev->params->rate_protection_type == 1) {
 			/* Protection*/
 			if (c->control.rates[index].flags &
@@ -424,7 +442,7 @@ static void get_rate(struct sk_buff *skb,
 			    ieee80211_has_protected(hdr->frame_control)) {
 				if (skb->len +
 				    c->control.hw_key->icv_len +
-				    FCS_LEN > dev->rts_threshold)
+				    dev->rts_threshold < FCS_LEN)
 					prot_type = USE_PROTECTION_RTS;
 			}
 
@@ -436,39 +454,39 @@ static void get_rate(struct sk_buff *skb,
 
 		}
 
-		/*No 3rd party device is using this, so diable for now*/
+		/*No 3rd party device is using this, so disable for now*/
 		if (txcmd->rate_flags[index] & ENABLE_VHT_FORMAT)
 			prot_type = USE_PROTECTION_NONE;
 
 		txcmd->rate_protection_type[index] = prot_type;
 
 
-		/* Do not set the flags for Managed Mode, they will come
-		 * from proc
-		 */
-		if (!is_mgd) {
-			if (c->control.rates[index].flags &
-					IEEE80211_TX_RC_GREEN_FIELD)
-				txcmd->rate_flags[index] |=
-						ENABLE_GREEN_FIELD;
-			if (c->control.rates[index].flags &
-					IEEE80211_TX_RC_40_MHZ_WIDTH)
-				txcmd->rate_flags[index] |=
-						ENABLE_CHNL_WIDTH_40MHZ;
-			if (c->control.rates[index].flags &
-					IEEE80211_TX_RC_80_MHZ_WIDTH)
-				txcmd->rate_flags[index] |=
-					ENABLE_CHNL_WIDTH_80MHZ;
-			if (c->control.rates[index].flags &
-					IEEE80211_TX_RC_SHORT_GI)
-				txcmd->rate_flags[index] |= ENABLE_SGI;
-		}
+		if (c->control.rates[index].flags &
+				IEEE80211_TX_RC_GREEN_FIELD)
+			txcmd->rate_flags[index] |=
+					ENABLE_GREEN_FIELD;
+		if (c->control.rates[index].flags &
+				IEEE80211_TX_RC_40_MHZ_WIDTH)
+			txcmd->rate_flags[index] |=
+					ENABLE_CHNL_WIDTH_40MHZ;
+		if (c->control.rates[index].flags &
+				IEEE80211_TX_RC_80_MHZ_WIDTH)
+			txcmd->rate_flags[index] |=
+				ENABLE_CHNL_WIDTH_80MHZ;
+		if (c->control.rates[index].flags &
+				IEEE80211_TX_RC_SHORT_GI)
+			txcmd->rate_flags[index] |= ENABLE_SGI;
 
 		/*Some Sanity Checks*/
-		/* Nss-1/2 */
-		if (txcmd->num_spatial_streams[index] <= 0 ||
-				txcmd->num_spatial_streams[index] > 2)
-			txcmd->num_spatial_streams[index] = 1;
+		if (nss <= max(MAX_TX_STREAMS, MAX_RX_STREAMS))
+			/*Got at-least one valid rate*/
+			all_rates_invalid = false;
+		else {
+			if (net_ratelimit())
+				UCCP_DEBUG_IF("UCCP420_WIFI:Skip Nss: %d\n",
+					      nss);
+			skip_rate = true;
+		}
 
 		/* VHT 20MHz MCS9 is not valid*/
 		if (txrate->flags & IEEE80211_TX_RC_VHT_MCS &&
@@ -477,8 +495,7 @@ static void get_rate(struct sk_buff *skb,
 			  ENABLE_CHNL_WIDTH_40MHZ) &&
 			!(txcmd->rate_flags[index] &
 			  ENABLE_CHNL_WIDTH_80MHZ))
-				/* Downgrade to VHT-MCS8-Nss-1 */
-			txcmd->rate[index] = 0x88;
+			skip_rate = true;
 
 		/*First Time*/
 #ifdef notyet
@@ -500,8 +517,23 @@ static void get_rate(struct sk_buff *skb,
 				  dev->name);
 		}
 #endif
+		if (skip_rate)
+			txcmd->rate_retries[index] = 0;
 
-		txcmd->num_rates++;
+	}
+
+	if (all_rates_invalid) {
+		/*use min supported rate*/
+		if (net_ratelimit())
+			UCCP_DEBUG_IF("UCCP420_WIFI:invalid rates\n");
+		txcmd->num_rates = 1;
+		txcmd->rate[0] = min_rate;
+		txcmd->rate_retries[0] = 5;
+		txcmd->rate_protection_type[0] = USE_PROTECTION_NONE;
+		txcmd->rate_preamble_type[0] = DONT_USE_SHORT_PREAMBLE;
+		txcmd->num_spatial_streams[0] = 1;
+		txcmd->bcc_or_ldpc = 0;
+		txcmd->stbc_enabled = 0;
 	}
 }
 
@@ -532,7 +564,8 @@ static int uccp420wlan_send_cmd(unsigned char *buf,
 
 	if (!nbuf) {
 		rcu_read_unlock();
-		return -1;
+		WARN_ON(1);
+		return -ENOMEM;
 	}
 	hdr->id = id;
 	hdr->length = len;
@@ -677,9 +710,8 @@ int uccp420wlan_proc_tx(void)
 	tx_cmd.num_frames_per_desc = skb_queue_len(skb_list);
 	tx_cmd.pkt_gram_payload_len = hdrlen;
 	tx_cmd.aggregate_mpdu = AMPDU_AGGR_DISABLED;
+	tx_cmd.rate_retries[index] = 1;
 
-	/* production test*/
-	tx_cmd.num_rates = 1;
 	if (dev->params->tx_fixed_mcs_indx != -1) {
 		tx_cmd.rate_preamble_type[index] =
 			dev->params->prod_mode_rate_preamble_type;
@@ -1255,46 +1287,46 @@ int uccp420wlan_prog_channel(unsigned int prim_ch,
 		}
 	dev = p->context;
 	if (dev->params->production_test == 1) {
-			if ((dev->params->prod_mode_chnl_bw_40_mhz == 1) &&
-				(dev->params->sec_ch_offset_40_minus == 1)) {
-				/*  NL80211_CHAN_HT40MINUS */
-				ch_width = 2;
-				cf_offset -= 10;
-			} else if (dev->params->prod_mode_chnl_bw_40_mhz == 1) {
-				/* NL80211_CHAN_HT40PLUS */
-				ch_width = 2;
-				cf_offset += 10;
-			}
+		if ((dev->params->prod_mode_chnl_bw_40_mhz == 1) &&
+			(dev->params->sec_ch_offset_40_minus == 1)) {
+			/*  NL80211_CHAN_HT40MINUS */
+			ch_width = 2;
+			cf_offset -= 10;
+		} else if (dev->params->prod_mode_chnl_bw_40_mhz == 1) {
+			/* NL80211_CHAN_HT40PLUS */
+			ch_width = 2;
+			cf_offset += 10;
+		}
 
-			is_vht_bw80 = vht_support &&
-				(dev->params->prod_mode_chnl_bw_80_mhz == 1);
+		is_vht_bw80 = vht_support &&
+			(dev->params->prod_mode_chnl_bw_80_mhz == 1);
 
-			is_vht_bw80_sec_40minus = is_vht_bw80 &&
-				(dev->params->sec_ch_offset_40_minus == 1);
+		is_vht_bw80_sec_40minus = is_vht_bw80 &&
+			(dev->params->sec_ch_offset_40_minus == 1);
 
-			is_vht_bw80_sec_40plus = is_vht_bw80 &&
-				(dev->params->sec_ch_offset_40_plus == 1);
+		is_vht_bw80_sec_40plus = is_vht_bw80 &&
+			(dev->params->sec_ch_offset_40_plus == 1);
 
-			if (is_vht_bw80)
-				ch_width = 3;
+		if (is_vht_bw80)
+			ch_width = 3;
 
-			if (is_vht_bw80_sec_40minus &&
-			    (dev->params->sec_40_ch_offset_80_minus == 1))
-				cf_offset -= 30;
-			else if (is_vht_bw80_sec_40minus &&
-				 (dev->params->sec_40_ch_offset_80_plus == 1))
-				cf_offset += 10;
-			else if (is_vht_bw80_sec_40minus)/* default */
-				cf_offset -= 30;
+		if (is_vht_bw80_sec_40minus &&
+		    (dev->params->sec_40_ch_offset_80_minus == 1))
+			cf_offset -= 30;
+		else if (is_vht_bw80_sec_40minus &&
+			 (dev->params->sec_40_ch_offset_80_plus == 1))
+			cf_offset += 10;
+		else if (is_vht_bw80_sec_40minus)/* default */
+			cf_offset -= 30;
 
-			if (is_vht_bw80_sec_40plus &&
-			    (dev->params->sec_40_ch_offset_80_minus == 1))
-				cf_offset -= 10;
-			else if (is_vht_bw80_sec_40plus &&
-				 (dev->params->sec_40_ch_offset_80_plus == 1))
-				cf_offset += 30;
-			else if (is_vht_bw80_sec_40plus)/* default */
-				cf_offset -= 10;
+		if (is_vht_bw80_sec_40plus &&
+		    (dev->params->sec_40_ch_offset_80_minus == 1))
+			cf_offset -= 10;
+		else if (is_vht_bw80_sec_40plus &&
+			 (dev->params->sec_40_ch_offset_80_plus == 1))
+			cf_offset += 30;
+		else if (is_vht_bw80_sec_40plus)/* default */
+			cf_offset -= 10;
 
 
 	}
@@ -1701,9 +1733,8 @@ int uccp420wlan_prog_tx(unsigned int queue,
 				dev->stats->tx_cmd_send_count_single++;
 			else if (skb_queue_len(txq) > 1)
 				dev->stats->tx_cmd_send_count_multi++;
-		} else {
+		} else
 			dev->stats->tx_cmd_send_count_beaconq++;
-		}
 #ifdef PERF_PROFILING
 	}
 #endif
@@ -2187,6 +2218,17 @@ int uccp420wlan_prog_econ_ps_state(int if_index,
 }
 #endif
 
+int uccp420wlan_prog_tx_deinit(int vif_index, char *peer_addr)
+{
+	struct cmd_tx_deinit cmd_tx_deinit;
+
+	memset(&cmd_tx_deinit, 0, (sizeof(struct cmd_tx_deinit)));
+	cmd_tx_deinit.if_index = vif_index;
+	ether_addr_copy(cmd_tx_deinit.peer_addr, peer_addr);
+	return uccp420wlan_send_cmd((unsigned char *) &cmd_tx_deinit,
+				    sizeof(struct cmd_tx_deinit),
+				    UMAC_CMD_TX_DEINIT);
+}
 
 int uccp420wlan_msg_handler(void *nbuff,
 			    unsigned char sender_id)
@@ -2238,7 +2280,7 @@ int uccp420wlan_msg_handler(void *nbuff,
 				     cmd_info.outstanding_ctrl_req);
 			pending_cmd = skb_dequeue(&cmd_info.outstanding_cmd);
 
-			if (unlikely(pending_cmd != NULL)) {
+			if (likely(pending_cmd != NULL)) {
 				UCCP_DEBUG_IF("Send 1 outstanding cmd\n");
 				hal_ops.send((void *)pending_cmd, HOST_MOD_ID,
 					     UMAC_MOD_ID, 0);
@@ -2266,8 +2308,7 @@ int uccp420wlan_msg_handler(void *nbuff,
 			(struct host_event_scanres *) buff,
 			buff +  sizeof(struct host_event_scanres), skb->len);
 
-	} else if (event == UMAC_EVENT_RX /* ||
-		   event == EVENT_RX_MIC_FAILURE*/) {
+	} else if (event == UMAC_EVENT_RX) {
 		if (dev->params->production_test) {
 			dev->stats->rx_packet_data_count++;
 			dev_kfree_skb_any(skb);
@@ -2417,6 +2458,8 @@ int uccp420wlan_msg_handler(void *nbuff,
 					     p->context);
 
 #endif
+	} else if (event == UMAC_EVENT_TX_DEINIT_DONE) {
+		dev->tx_deinit_complete = 1;
 	} else if (event == UMAC_EVENT_FW_ERROR) {
 		pr_err("%s: FW is in Error State, please reload.\n", __func__);
 	} else {

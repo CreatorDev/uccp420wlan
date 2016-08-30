@@ -28,27 +28,29 @@
 
 #define UMAC_PRINT(fmt, args...) pr_debug(fmt, ##args)
 
-#define UCCP_DEBUG_CORE(fmt, ...)                           \
-do {                                                                    \
-		if (uccp_debug & UCCP_DEBUG_CORE)                       \
-			pr_debug(fmt, ##__VA_ARGS__);  \
+#define UCCP_DEBUG_CORE(fmt, ...)            \
+do {                                          \
+	if (uccp_debug & UCCP_DEBUG_CORE)      \
+		pr_debug(fmt, ##__VA_ARGS__);   \
 } while (0)
 
-#define UCCP_DEBUG_RX(fmt, ...)                           \
-do {                                                                    \
-		if ((uccp_debug & UCCP_DEBUG_RX) && net_ratelimit())     \
-			pr_debug(fmt, ##__VA_ARGS__);  \
+#define UCCP_DEBUG_RX(fmt, ...)                            \
+do {                                                        \
+	if ((uccp_debug & UCCP_DEBUG_RX) && net_ratelimit()) \
+		pr_debug(fmt, ##__VA_ARGS__);                 \
 } while (0)
 
 
 #define UCCP_DEBUG_DUMP_RX(fmt, ...)                           \
-do {                                                                    \
-		if (uccp_debug & UCCP_DEBUG_DUMP_RX)                       \
-			print_hex_dump(KERN_DEBUG, fmt, ##__VA_ARGS__);  \
+do {                                                            \
+	if (uccp_debug & UCCP_DEBUG_DUMP_RX)                     \
+		print_hex_dump(KERN_DEBUG, fmt, ##__VA_ARGS__);   \
 } while (0)
 
 
 #define DUMP_RX (uccp_debug & UCCP_DEBUG_DUMP_RX)
+
+
 
 spinlock_t tsf_lock;
 
@@ -120,7 +122,7 @@ check_scan_abort_complete:
 	if (!dev->scan_abort_done && (count < SCAN_ABORT_TIMEOUT_TICKS)) {
 		current->state = TASK_INTERRUPTIBLE;
 
-		if (0 == schedule_timeout(1))
+		if (schedule_timeout(1) == 0)
 			count++;
 
 		goto check_scan_abort_complete;
@@ -147,7 +149,7 @@ int wait_for_cancel_hw_roc(struct mac80211_dev *dev)
 check_cancel_hw_roc_complete:
 	if (!dev->cancel_hw_roc_done && (count < CANCEL_HW_ROC_TIMEOUT_TICKS)) {
 		current->state = TASK_INTERRUPTIBLE;
-		if (0 == schedule_timeout(1))
+		if (schedule_timeout(1) == 0)
 			count++;
 		goto check_cancel_hw_roc_complete;
 	}
@@ -177,7 +179,7 @@ check_ch_prog_complete:
 	if (!dev->chan_prog_done && (count < CH_PROG_TIMEOUT_TICKS)) {
 		current->state = TASK_INTERRUPTIBLE;
 
-		if (0 == schedule_timeout(1))
+		if (schedule_timeout(1) == 0)
 			count++;
 
 		goto check_ch_prog_complete;
@@ -196,6 +198,32 @@ check_ch_prog_complete:
 
 }
 
+int wait_for_tx_deinit_complete(struct mac80211_dev *dev)
+{
+	int count = 0;
+
+check_tx_deinit_complete:
+	if (!dev->tx_deinit_complete &&
+	    (count < TX_DEINIT_TIMEOUT_TICKS)) {
+		current->state = TASK_INTERRUPTIBLE;
+		if (schedule_timeout(1) == 0)
+			count++;
+		goto check_tx_deinit_complete;
+	}
+
+	if (!dev->tx_deinit_complete) {
+		pr_err("%s-UMAC: Warning: Tx discard failed after %ld timer ticks\n",
+		       dev->name,
+		       TX_DEINIT_TIMEOUT_TICKS);
+		return -1;
+	}
+
+	UCCP_DEBUG_CORE("Discarded Tx successfully in %d timer ticks\n",
+			count);
+
+	return 0;
+}
+
 int wait_for_tx_queue_flush_complete(struct mac80211_dev *dev,
 				     unsigned int queue)
 {
@@ -205,7 +233,7 @@ check_tx_queue_flush_complete:
 	if (dev->tx.outstanding_tokens[queue] &&
 	    (count < QUEUE_FLUSH_TIMEOUT_TICKS)) {
 		current->state = TASK_INTERRUPTIBLE;
-		if (0 == schedule_timeout(1))
+		if (schedule_timeout(1) == 0)
 			count++;
 		goto check_tx_queue_flush_complete;
 	}
@@ -239,7 +267,7 @@ check_reset_complete:
 	if (!dev->reset_complete && (count < RESET_TIMEOUT_TICKS)) {
 		current->state = TASK_INTERRUPTIBLE;
 
-		if (0 == schedule_timeout(1))
+		if (schedule_timeout(1) == 0)
 			count++;
 
 		goto check_reset_complete;
@@ -291,7 +319,7 @@ static void driver_tput_timer_expiry(unsigned long data)
 
 void proc_bss_info_changed(unsigned char *mac_addr, int value)
 {
-		int temp = 0, i = 0, j = 0;
+		int temp = 0, i = 0, j = 0, ret = 0;
 
 		get_random_bytes(&j, sizeof(j));
 		for (i = 5; i > 0; i--) {
@@ -300,8 +328,12 @@ void proc_bss_info_changed(unsigned char *mac_addr, int value)
 			bss_addr[i] = bss_addr[j];
 			bss_addr[j] = temp;
 			}
-		uccp420wlan_prog_vif_bssid(0, mac_addr, bss_addr);
-
+		CALL_UMAC(uccp420wlan_prog_vif_bssid,
+			  0,
+			  mac_addr,
+			  bss_addr);
+prog_umac_fail:
+	return;
 }
 
 void packet_generation(unsigned long data)
@@ -425,6 +457,7 @@ reschedule_timer:
 
 int uccp420wlan_core_init(struct mac80211_dev *dev, unsigned int ftm)
 {
+	int ret = 0;
 
 	UCCP_DEBUG_CORE("%s-UMAC: Init called\n", dev->name);
 	spin_lock_init(&tsf_lock);
@@ -435,47 +468,64 @@ int uccp420wlan_core_init(struct mac80211_dev *dev, unsigned int ftm)
 
 	UMAC_PRINT("%s-UMAC: Reset (ENABLE)\n", dev->name);
 
-	if (hal_ops.start())
+	if (hal_ops.start()) {
+		ret = -1;
 		goto lmac_deinit;
+	}
 
 	if (hal_ops.init_bufs(NUM_TX_DESCS,
 			      NUM_RX_BUFS_2K,
 			      NUM_RX_BUFS_12K,
-			      dev->params->max_data_size) < 0)
+			      dev->params->max_data_size) < 0) {
+		ret = -1;
 		goto hal_stop;
+	}
 
 	if (ftm)
-		uccp420wlan_prog_reset(LMAC_ENABLE, LMAC_MODE_FTM);
+		CALL_UMAC(uccp420wlan_prog_reset,
+			  LMAC_ENABLE,
+			  LMAC_MODE_FTM);
 	else
-		uccp420wlan_prog_reset(LMAC_ENABLE, LMAC_MODE_NORMAL);
+		CALL_UMAC(uccp420wlan_prog_reset,
+			  LMAC_ENABLE,
+			  LMAC_MODE_NORMAL);
 
-	if (wait_for_reset_complete(dev) < 0)
+	if (wait_for_reset_complete(dev) < 0) {
+		ret = -1;
 		goto hal_deinit_bufs;
+	}
 
 
-	uccp420wlan_prog_btinfo(dev->params->bt_state);
-	uccp420wlan_prog_global_cfg(512, /* Rx MSDU life time in msecs */
-				    512, /* Tx MSDU life time in msecs */
-				    dev->params->ed_sensitivity,
-				    dev->params->auto_sensitivity,
-				    dev->params->rf_params);
+	CALL_UMAC(uccp420wlan_prog_btinfo, dev->params->bt_state);
 
-	uccp420wlan_prog_txpower(dev->txpower);
+	CALL_UMAC(uccp420wlan_prog_global_cfg,
+		  512, /* Rx MSDU life time in msecs */
+		  512, /* Tx MSDU life time in msecs */
+		  dev->params->ed_sensitivity,
+		  dev->params->auto_sensitivity,
+		  dev->params->rf_params);
+
+	CALL_UMAC(uccp420wlan_prog_txpower, dev->txpower);
+
 	uccp420wlan_tx_init(dev);
+
 
 	return 0;
 hal_deinit_bufs:
 	hal_ops.deinit_bufs();
+prog_umac_fail:
 hal_stop:
 	hal_ops.stop();
 lmac_deinit:
 	uccp420wlan_lmac_if_deinit();
-	return -1;
+	return ret;
 }
 
 
 void uccp420wlan_core_deinit(struct mac80211_dev *dev, unsigned int ftm)
 {
+	int ret = 0;
+
 	UCCP_DEBUG_CORE("%s-UMAC: De-init called\n", dev->name);
 
 	/* De initialize tx  and disable LMAC*/
@@ -486,13 +536,17 @@ void uccp420wlan_core_deinit(struct mac80211_dev *dev, unsigned int ftm)
 	UMAC_PRINT("%s-UMAC: Reset (DISABLE)\n", dev->name);
 
 	if (ftm)
-		uccp420wlan_prog_reset(LMAC_DISABLE, LMAC_MODE_FTM);
+		CALL_UMAC(uccp420wlan_prog_reset,
+			  LMAC_DISABLE,
+			  LMAC_MODE_FTM);
 	else
-		uccp420wlan_prog_reset(LMAC_DISABLE, LMAC_MODE_NORMAL);
-
+		CALL_UMAC(uccp420wlan_prog_reset,
+			  LMAC_DISABLE,
+			  LMAC_MODE_NORMAL);
 
 	wait_for_reset_complete(dev);
 
+prog_umac_fail:
 	uccp420_lmac_if_free_outstnding();
 
 	hal_ops.stop();
@@ -506,6 +560,7 @@ void uccp420wlan_vif_add(struct umac_vif *uvif)
 {
 	unsigned int type;
 	struct ieee80211_conf *conf = &uvif->dev->hw->conf;
+	int ret = 0;
 
 	UCCP_DEBUG_CORE("%s-UMAC: Add VIF %d Type = %d\n",
 		   uvif->dev->name,
@@ -547,17 +602,20 @@ void uccp420wlan_vif_add(struct umac_vif *uvif)
 	uvif->driver_tput_timer.data = (unsigned long)uvif;
 	uvif->driver_tput_timer.function = driver_tput_timer_expiry;
 #endif
-	uccp420wlan_prog_vif_ctrl(uvif->vif_index,
-				  uvif->vif->addr,
-				  type,
-				  IF_ADD);
+	CALL_UMAC(uccp420wlan_prog_vif_ctrl,
+		  uvif->vif_index,
+		  uvif->vif->addr,
+		  type,
+		  IF_ADD);
 
 	/* Reprogram retry counts */
-	uccp420wlan_prog_short_retry(uvif->vif_index, uvif->vif->addr,
-					 conf->short_frame_max_tx_count);
+	CALL_UMAC(uccp420wlan_prog_short_retry,
+		  uvif->vif_index, uvif->vif->addr,
+		  conf->short_frame_max_tx_count);
 
-	uccp420wlan_prog_long_retry(uvif->vif_index, uvif->vif->addr,
-					conf->long_frame_max_tx_count);
+	CALL_UMAC(uccp420wlan_prog_long_retry,
+		  uvif->vif_index, uvif->vif->addr,
+		  conf->long_frame_max_tx_count);
 
 	if (uvif->vif->type == NL80211_IFTYPE_AP) {
 		/* Program the EDCA params */
@@ -575,16 +633,19 @@ void uccp420wlan_vif_add(struct umac_vif *uvif)
 			cwmax = uvif->config.edca_params[queue].cwmax;
 			uapsd = uvif->config.edca_params[queue].uapsd;
 
-			uccp420wlan_prog_txq_params(uvif->vif_index,
-						    uvif->vif->addr,
-						    queue,
-						    aifs,
-						    txop,
-						    cwmin,
-						    cwmax,
-						    uapsd);
+			CALL_UMAC(uccp420wlan_prog_txq_params,
+				  uvif->vif_index,
+				  uvif->vif->addr,
+				  queue,
+				  aifs,
+				  txop,
+				  cwmin,
+				  cwmax,
+				  uapsd);
 		}
 	}
+prog_umac_fail:
+	return;
 }
 
 
@@ -592,6 +653,7 @@ void uccp420wlan_vif_remove(struct umac_vif *uvif)
 {
 	struct sk_buff *skb;
 	unsigned int type;
+	int ret = 0;
 
 	UCCP_DEBUG_CORE("%s-UMAC: Remove VIF %d called\n",
 					uvif->dev->name,
@@ -625,11 +687,14 @@ void uccp420wlan_vif_remove(struct umac_vif *uvif)
 
 	spin_unlock_bh(&uvif->noa_que.lock);
 
-	uccp420wlan_prog_vif_ctrl(uvif->vif_index,
-				  uvif->vif->addr,
-				  type,
-				  IF_REM);
+	CALL_UMAC(uccp420wlan_prog_vif_ctrl,
+		  uvif->vif_index,
+		  uvif->vif->addr,
+		  type,
+		  IF_REM);
 
+prog_umac_fail:
+	return;
 }
 
 
@@ -638,6 +703,8 @@ void uccp420wlan_vif_set_edca_params(unsigned short queue,
 				     struct edca_params *params,
 				     unsigned int vif_active)
 {
+	int ret = 0;
+
 	switch (queue) {
 	case 0:
 		queue = 3; /* Voice */
@@ -688,15 +755,17 @@ void uccp420wlan_vif_set_edca_params(unsigned short queue,
 		return;
 
 	/* Program the txq parameters into the LMAC */
-	uccp420wlan_prog_txq_params(uvif->vif_index,
-				    uvif->vif->addr,
-				    queue,
-				    params->aifs,
-				    params->txop,
-				    params->cwmin,
-				    params->cwmax,
-				    params->uapsd);
-
+	CALL_UMAC(uccp420wlan_prog_txq_params,
+		  uvif->vif_index,
+		  uvif->vif->addr,
+		  queue,
+		  params->aifs,
+		  params->txop,
+		  params->cwmin,
+		  params->cwmax,
+		  params->uapsd);
+prog_umac_fail:
+	return;
 }
 
 
@@ -711,24 +780,29 @@ void uccp420wlan_vif_bss_info_changed(struct umac_vif *uvif,
 	int chan = 0;
 	unsigned int bform_enable = 0;
 	unsigned int bform_per = 0;
+	int ret = 0;
 
 	UCCP_DEBUG_CORE("%s-CORE: BSS INFO changed %d, %d, %d\n",
 		uvif->dev->name, uvif->vif_index, uvif->vif->type, changed);
 
 
 	if (changed & BSS_CHANGED_BSSID)
-		uccp420wlan_prog_vif_bssid(uvif->vif_index, uvif->vif->addr,
-					   (unsigned char *)bss_conf->bssid);
+		CALL_UMAC(uccp420wlan_prog_vif_bssid,
+			   uvif->vif_index,
+			   uvif->vif->addr,
+			   (unsigned char *)bss_conf->bssid);
 
 	if (changed & BSS_CHANGED_BASIC_RATES) {
 		if (bss_conf->basic_rates)
-			uccp420wlan_prog_vif_basic_rates(uvif->vif_index,
-							 uvif->vif->addr,
-							 bss_conf->basic_rates);
+			CALL_UMAC(uccp420wlan_prog_vif_basic_rates,
+				  uvif->vif_index,
+				  uvif->vif->addr,
+				  bss_conf->basic_rates);
 		else
-			uccp420wlan_prog_vif_basic_rates(uvif->vif_index,
-							 uvif->vif->addr,
-							 0x153);
+			CALL_UMAC(uccp420wlan_prog_vif_basic_rates,
+				  uvif->vif_index,
+				  uvif->vif->addr,
+				  0x153);
 	}
 
 	if (changed & BSS_CHANGED_ERP_SLOT) {
@@ -739,9 +813,10 @@ void uccp420wlan_vif_bss_info_changed(struct umac_vif *uvif,
 		unsigned int cwmax = 0;
 		unsigned int uapsd = 0;
 
-		uccp420wlan_prog_vif_short_slot(uvif->vif_index,
-						uvif->vif->addr,
-						bss_conf->use_short_slot);
+		CALL_UMAC(uccp420wlan_prog_vif_short_slot,
+			  uvif->vif_index,
+			  uvif->vif->addr,
+			  bss_conf->use_short_slot);
 
 		for (queue = 0; queue < WLAN_AC_MAX_CNT; queue++) {
 			aifs = uvif->config.edca_params[queue].aifs;
@@ -751,14 +826,15 @@ void uccp420wlan_vif_bss_info_changed(struct umac_vif *uvif,
 			uapsd = uvif->config.edca_params[queue].uapsd;
 
 			if (uvif->config.edca_params[queue].cwmin != 0)
-				uccp420wlan_prog_txq_params(uvif->vif_index,
-							    uvif->vif->addr,
-							    queue,
-							    aifs,
-							    txop,
-							    cwmin,
-							    cwmax,
-							    uapsd);
+				CALL_UMAC(uccp420wlan_prog_txq_params,
+					  uvif->vif_index,
+					  uvif->vif->addr,
+					  queue,
+					  aifs,
+					  txop,
+					  cwmin,
+					  cwmax,
+					  uapsd);
 		}
 	}
 
@@ -777,28 +853,33 @@ void uccp420wlan_vif_bss_info_changed(struct umac_vif *uvif,
 					   bss_conf->assoc_capability |
 					   (bss_conf->qos << 9));
 
-				uccp420wlan_prog_vif_conn_state(uvif->vif_index,
-								uvif->vif->addr,
-								STA_CONN);
+				CALL_UMAC(uccp420wlan_prog_vif_conn_state,
+					  uvif->vif_index,
+					  uvif->vif->addr,
+					  STA_CONN);
 
-				uccp420wlan_prog_vif_aid(uvif->vif_index,
-							 uvif->vif->addr,
-							 bss_conf->aid);
+				CALL_UMAC(uccp420wlan_prog_vif_aid,
+					  uvif->vif_index,
+					  uvif->vif->addr,
+					  bss_conf->aid);
 
-				uccp420wlan_prog_vif_op_channel(uvif->vif_index,
-								uvif->vif->addr,
-								chan);
+				CALL_UMAC(uccp420wlan_prog_vif_op_channel,
+					  uvif->vif_index,
+					  uvif->vif->addr,
+					  chan);
 
 				caps = (bss_conf->assoc_capability |
 					(bss_conf->qos << 9));
 
-				uccp420wlan_prog_vif_assoc_cap(uvif->vif_index,
-							       uvif->vif->addr,
-							       caps);
+				CALL_UMAC(uccp420wlan_prog_vif_assoc_cap,
+					  uvif->vif_index,
+					  uvif->vif->addr,
+					  caps);
 
 				if (uvif->dev->params->vht_beamform_support)
-					uccp420wlan_prog_vht_bform(bform_enable,
-								   bform_per);
+					CALL_UMAC(uccp420wlan_prog_vht_bform,
+						  bform_enable,
+						  bform_per);
 
 				uvif->noa_active = 0;
 				uvif->dev->params->is_associated = 1;
@@ -810,28 +891,32 @@ void uccp420wlan_vif_bss_info_changed(struct umac_vif *uvif,
 			} else {
 				uvif->dev->params->is_associated = 0;
 
-				uccp420wlan_prog_vif_conn_state(uvif->vif_index,
-								uvif->vif->addr,
-								STA_DISCONN);
+				CALL_UMAC(uccp420wlan_prog_vif_conn_state,
+					  uvif->vif_index,
+					  uvif->vif->addr,
+					  STA_DISCONN);
 
-				uccp420wlan_prog_vht_bform(VHT_BEAMFORM_DISABLE,
-							   bform_per);
+				CALL_UMAC(uccp420wlan_prog_vht_bform,
+					  VHT_BEAMFORM_DISABLE,
+					  bform_per);
 				uvif->dev->params->
 					sync[uvif->vif_index].status = 0;
 			}
 		}
 
 		if (changed & BSS_CHANGED_BEACON_INT) {
-			uccp420wlan_prog_vif_beacon_int(uvif->vif_index,
-							uvif->vif->addr,
-							bss_conf->beacon_int);
+			CALL_UMAC(uccp420wlan_prog_vif_beacon_int,
+				  uvif->vif_index,
+				  uvif->vif->addr,
+				  bss_conf->beacon_int);
 
 		}
 
 		if (changed & BSS_CHANGED_BEACON_INFO) {
-			uccp420wlan_prog_vif_dtim_period(uvif->vif_index,
-							 uvif->vif->addr,
-							 bss_conf->dtim_period);
+			CALL_UMAC(uccp420wlan_prog_vif_dtim_period,
+				  uvif->vif_index,
+				  uvif->vif->addr,
+				   bss_conf->dtim_period);
 
 		}
 
@@ -858,9 +943,10 @@ void uccp420wlan_vif_bss_info_changed(struct umac_vif *uvif,
 				mod_timer(&uvif->bcn_timer,
 					  jiffies + bcn_tim_val);
 
-				uccp420wlan_prog_vif_beacon_int(uvif->vif_index,
-								uvif->vif->addr,
-								bcn_int);
+				CALL_UMAC(uccp420wlan_prog_vif_beacon_int,
+					  uvif->vif_index,
+					  uvif->vif->addr,
+					  bcn_int);
 			}
 		}
 
@@ -887,9 +973,10 @@ void uccp420wlan_vif_bss_info_changed(struct umac_vif *uvif,
 				mod_timer(&uvif->bcn_timer,
 					  jiffies + bcn_tim_val);
 
-				uccp420wlan_prog_vif_beacon_int(uvif->vif_index,
-								uvif->vif->addr,
-								bcn_int);
+				CALL_UMAC(uccp420wlan_prog_vif_beacon_int,
+					  uvif->vif_index,
+					  uvif->vif->addr,
+					  bcn_int);
 			}
 		}
 
@@ -898,7 +985,8 @@ void uccp420wlan_vif_bss_info_changed(struct umac_vif *uvif,
 		WARN_ON(1);
 		return;
 	}
-
+prog_umac_fail:
+	return;
 }
 
 

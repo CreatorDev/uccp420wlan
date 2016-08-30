@@ -25,8 +25,9 @@
 #ifndef _FWLDR_H_
 #define _FWLDR_H_
 
-#include <linux/skbuff.h>
 #include <linux/interrupt.h>
+#include <linux/skbuff.h>
+
 #include "hal.h"
 #include "version.h"
 

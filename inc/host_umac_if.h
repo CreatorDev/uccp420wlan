@@ -26,6 +26,7 @@
 #define _UCCP420HOST_UMAC_IF_H_
 
 #include "hal.h"
+
 #define MCST_ADDR_LIMIT	48
 #define WLAN_ADDR_LEN 6
 #define TKIP_MIC_LEN 8
@@ -415,6 +416,7 @@ enum UMAC_CMD_TAG {
 	UMAC_CMD_CHANCTX_TIME_INFO,
 #endif
 	UMAC_CMD_CONT_TX,
+	UMAC_CMD_TX_DEINIT,
 };
 
 enum UMAC_EVENT_TAG {
@@ -448,6 +450,7 @@ enum UMAC_EVENT_TAG {
 	UMAC_EVENT_CHAN_SWITCH,
 #endif
 	UMAC_EVENT_FW_ERROR,
+	UMAC_EVENT_TX_DEINIT_DONE,
 };
 
 enum CONNECT_RESULT_TAG {
@@ -1003,6 +1006,12 @@ struct cmd_chanctx_time_config {
 } __packed;
 #endif
 
+struct cmd_tx_deinit {
+	struct host_mac_msg_hdr hdr;
+	unsigned int if_index;
+	unsigned char peer_addr[ETH_ALEN];
+} __packed;
+
 /* Events */
 
 struct nw_found_event {
@@ -1155,6 +1164,16 @@ struct cmd_bt_info {
 struct umac_event_roc_status {
 	struct host_mac_msg_hdr hdr;
 	unsigned int roc_status;
+} __packed;
+
+enum TX_DEINIT_DONE_STATUS {
+	TX_DEINIT_DONE_SUCCESS = 0,
+	TX_DEINIT_DONE_FAIL,
+};
+
+struct umac_event_tx_deinit_done {
+	struct host_mac_msg_hdr hdr;
+	enum TX_DEINIT_DONE_STATUS status;
 } __packed;
 
 #endif /*_UCCP420HOST_UMAC_IF_H_*/

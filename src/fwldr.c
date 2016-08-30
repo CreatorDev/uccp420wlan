@@ -23,13 +23,13 @@
  * USA.
  */
 
+#include <linux/delay.h>
+#include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
-#include <linux/dma-mapping.h>
-#include <linux/delay.h>
 #include <linux/slab.h>
 
-#include <fwldr.h>
+#include "fwldr.h"
 
 struct fwload_priv  *fpriv, fpv;
 
@@ -1181,7 +1181,7 @@ static int fwldr_wait_for_completion(void)
 
 		i++;
 
-	} while ((UCCP_THRD_EXEC_SIG != rw_v.val) && (i < 1000));
+	} while ((rw_v.val != UCCP_THRD_EXEC_SIG) && (i < 1000));
 
 	if (i == 1000)
 		result = 0;

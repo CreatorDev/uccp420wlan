@@ -22,33 +22,31 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
  * USA.
  */
-
-#include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/interrupt.h>
-#include <linux/skbuff.h>
-#include <linux/slab.h>
-#include <linux/netdevice.h>
-#include <linux/proc_fs.h>
-
 #include <asm/unaligned.h>
 
-#include <linux/time.h>
-#include <linux/sort.h>
+#include <linux/clk.h>
 #include <linux/etherdevice.h>
-#include "core.h"
-#include "hal.h"
-#include "hal_hostport.h"
-#include "fwldr.h"
-
+#include <linux/iio/consumer.h>
+#include <linux/interrupt.h>
+#include <linux/module.h>
+#include <linux/moduleparam.h>
+#include <linux/netdevice.h>
 #include <linux/of.h>
 #include <linux/of_net.h>
 #include <linux/of_device.h>
-#include <linux/module.h>
-#include <linux/clk.h>
-#include <linux/iio/consumer.h>
 #include <linux/proc_fs.h>
+#include <linux/skbuff.h>
+#include <linux/slab.h>
+#include <linux/sort.h>
 #include <linux/syscore_ops.h>
+#include <linux/time.h>
+
+
+#include "core.h"
+#include "fwldr.h"
+#include "hal.h"
+#include "hal_hostport.h"
+
 
 #define COMMAND_START_MAGIC 0xDEAD
 
@@ -71,7 +69,8 @@ unsigned int hal_event_recv;
 struct timer_list stats_timer;
 unsigned int alloc_skb_failures;
 unsigned int alloc_skb_dma_region;
-unsigned int alloc_skb_priv_region;
+unsigned int alloc_skb_priv_tx_region;
+unsigned int alloc_skb_priv_rx_region;
 unsigned int alloc_skb_priv_runtime;
 
 static unsigned int uccp_ddr_base;
@@ -225,7 +224,7 @@ int hal_get_dump_core(unsigned long  *dump_start, unsigned char region_type)
 {
 	unsigned int *core_dump;
 	unsigned long len = 0;
-	unsigned long region_start;
+	unsigned long region_start = 0;
 
 	if (region_type == UCCP_REGION_TYPE_COREA) {
 		len = UCCP_COREA_REGION_LEN;
@@ -338,7 +337,7 @@ static void tx_tasklet_fn(unsigned long data)
 
 		while (!hal_ready(priv) &&
 		     time_before(jiffies, start + msecs_to_jiffies(1000))) {
-			;
+			cpu_relax();
 		}
 
 		if (!hal_ready(priv)) {
@@ -1082,8 +1081,11 @@ static int proc_read_hal_stats(struct seq_file *m, void *v)
 	seq_printf(m, "Alloc SKB in 60 MB DMA Region  %d\n",
 		   alloc_skb_dma_region);
 
-	seq_printf(m, "Alloc SKB in Priv 4 MB Region: %d\n",
-		   alloc_skb_priv_region);
+	seq_printf(m, "Alloc SKB in Priv 4 MB TX Region: %d\n",
+		   alloc_skb_priv_tx_region);
+
+	seq_printf(m, "Alloc SKB in Priv 4 MB RX Region: %d\n",
+		   alloc_skb_priv_rx_region);
 
 	seq_printf(m, "Alloc SKB Run time: %d\n", alloc_skb_priv_runtime);
 
@@ -1141,10 +1143,10 @@ static void stats_timer_expiry(unsigned long data)
 		alloc_skb_dma_region = 0;
 	}
 
-	if (alloc_skb_priv_region) {
+	if (alloc_skb_priv_rx_region) {
 		pr_info("Alloc SKB in Priv 4 MB Region: %d\n",
-			alloc_skb_priv_region);
-		alloc_skb_priv_region = 0;
+			alloc_skb_priv_rx_region);
+		alloc_skb_priv_rx_region = 0;
 	}
 
 	if (alloc_skb_failures) {
@@ -1249,7 +1251,7 @@ static inline int conv_str_to_byte(unsigned char *byte,
 /* Unmap and release all resoruces*/
 static int cleanup_all_resources(void)
 {
-	/* Unmap UCCP core memory */
+	/* Unmap UCCP sysbus memory */
 	iounmap((void __iomem *)hpriv->uccp_sysbus_base_addr);
 	release_mem_region(hpriv->uccp_sysbus_base, hpriv->uccp_sysbus_len);
 
@@ -1258,15 +1260,28 @@ static int cleanup_all_resources(void)
 	release_mem_region(hpriv->uccp_perip_base, hpriv->uccp_perip_len);
 
 	/* Unmap GRAM */
+	if (hpriv->gram_b4_addr)
+		iounmap((void __iomem *)hpriv->gram_b4_addr);
+	if (hpriv->uccp_gram_base) {
+		release_mem_region(hpriv->uccp_gram_base,
+				   hpriv->uccp_gram_len);
+	}
 	iounmap((void __iomem *)hpriv->gram_base_addr);
 	release_mem_region(hpriv->uccp_pkd_gram_base,
 			   hpriv->uccp_pkd_gram_len);
 
-	/* Unmap UCCP Host RAM */
+	/* Free UCCP Host RAM */
 	kfree(hpriv->base_addr_uccp_host_ram);
 	hpriv->base_addr_uccp_host_ram = NULL;
 
+	/* Free UCCP HAL TX data */
+	kfree(hpriv->hal_tx_data);
+	hpriv->hal_tx_data = NULL;
+
+	/* Free private structure */
 	kfree(hpriv);
+	hpriv = NULL;
+
 	return 0;
 }
 
@@ -1487,24 +1502,19 @@ static int hal_init(void *dev)
 				 "uccp"))) {
 		pr_err("%s: request_mem_region failed for UCCP core region\n",
 		       hal_name);
-
-		kfree(hpriv);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto free_hpriv;
 	}
 
 	hpriv->uccp_sysbus_base_addr = (unsigned long)devm_ioremap(dev,
 							hpriv->uccp_sysbus_base,
 							hpriv->uccp_sysbus_len);
 
-	if (hpriv->uccp_sysbus_base_addr == 0) {
+	if (!hpriv->uccp_sysbus_base_addr) {
 		pr_err("%s: Ioremap failed for UCCP core mem region\n",
 			hal_name);
-
-		release_mem_region(hpriv->uccp_sysbus_base,
-				   hpriv->uccp_sysbus_len);
-		kfree(hpriv);
-
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto uccp_sysbus_release;
 	}
 
 	hpriv->uccp_mem_addr = hpriv->uccp_sysbus_base_addr +
@@ -1516,27 +1526,19 @@ static int hal_init(void *dev)
 				 "uccp"))) {
 		pr_err("%s: request_mem_region failed for UCCP perip region\n",
 		       hal_name);
-
-		kfree(hpriv);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto uccp_sysbus_unmap;
 	}
 
 	hpriv->uccp_perip_base_addr =
 	(unsigned long) devm_ioremap(dev, hpriv->uccp_perip_base,
 				     hpriv->uccp_perip_len);
 
-	if (hpriv->uccp_perip_base_addr == 0) {
+	if (!hpriv->uccp_perip_base_addr) {
 		pr_err("%s: Ioremap failed for UCCP perip mem region\n",
 			hal_name);
-
-		iounmap((void __iomem *)hpriv->uccp_sysbus_base_addr);
-		release_mem_region(hpriv->uccp_sysbus_base,
-				   hpriv->uccp_sysbus_len);
-		release_mem_region(hpriv->uccp_perip_base,
-				   hpriv->uccp_perip_len);
-		kfree(hpriv);
-
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto uccp_perip_release;
 	}
 
 	/* Map GRAM */
@@ -1545,59 +1547,41 @@ static int hal_init(void *dev)
 				"wlan_gram")) {
 		pr_err("%s: request_mem_region failed for GRAM\n",
 		       hal_name);
-
-		iounmap((void __iomem *)hpriv->uccp_sysbus_base_addr);
-		release_mem_region(hpriv->uccp_sysbus_base,
-				   hpriv->uccp_sysbus_len);
-
-		kfree(hpriv);
-
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto uccp_perip_unmap;
 	}
 
 	hpriv->gram_base_addr =
 		(unsigned long)devm_ioremap(dev, hpriv->uccp_pkd_gram_base,
 				       hpriv->uccp_pkd_gram_len);
-	if (hpriv->gram_base_addr == 0) {
-		pr_err("%s: Ioremap failed for g ram region.\n",
+	if (!hpriv->gram_base_addr) {
+		pr_err("%s: Ioremap failed for gram region.\n",
 		       hal_name);
-
-		iounmap((void __iomem *)hpriv->uccp_sysbus_base_addr);
-		release_mem_region(hpriv->uccp_sysbus_base,
-				   hpriv->uccp_sysbus_len);
-		release_mem_region(hpriv->uccp_pkd_gram_base,
-				   hpriv->uccp_pkd_gram_len);
-
-		kfree(hpriv);
-
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto uccp_gram_pkd_release;
 	}
 
 	hpriv->gram_mem_addr = hpriv->gram_base_addr + hpriv->shm_offset;
 
+	/* Try GFP_DMA, to get the buffer in ZONE_DMA.
+	 */
 	hpriv->base_addr_uccp_host_ram = kmalloc(HAL_HOST_BOUNCE_BUF_LEN,
-						 GFP_KERNEL);
+						 GFP_DMA);
 
 	if (!hpriv->base_addr_uccp_host_ram) {
-		iounmap((void __iomem *)hpriv->uccp_sysbus_base_addr);
-		release_mem_region(hpriv->uccp_sysbus_base,
-				   hpriv->uccp_sysbus_len);
-
-		iounmap((void __iomem *)hpriv->gram_base_addr);
-		release_mem_region(hpriv->uccp_pkd_gram_base,
-				   hpriv->uccp_pkd_gram_len);
-
-		kfree(hpriv);
-
-		return -ENOMEM;
+		pr_err("%s: uccp host ram: failed to allocate memory\n",
+			       hal_name);
+		err = -ENOMEM;
+		goto uccp_gram_unmap;
 	}
 
 	phys_64mb = virt_to_phys(hpriv->base_addr_uccp_host_ram);
 
-	UCCP_DEBUG_HAL("%s: kmalloc success: %p an phy: 0x%x\n",
-		 __func__,
-		 hpriv->base_addr_uccp_host_ram,
-		 phys_64mb);
+	pr_err("%s: kmalloc success: %p an phy: 0x%x end: %p\n",
+	       __func__,
+	       hpriv->base_addr_uccp_host_ram,
+	       phys_64mb,
+	       hpriv->base_addr_uccp_host_ram + HAL_HOST_ZONE_DMA_LEN);
 
 	/* Program the 64MB base address to the RPU.
 	 * RPU can access only 64MB starting from this
@@ -1613,6 +1597,7 @@ static int hal_init(void *dev)
 	value = value << 10;
 	writel(value, rpusocwrap + 0x218);
 
+	pr_err("%s: kmalloc success: %x\n", __func__, uccp_ddr_base);
 
 	if (hpriv->uccp_gram_base) {
 
@@ -1622,24 +1607,19 @@ static int hal_init(void *dev)
 				 "uccp_gram_base"))) {
 			pr_err("%s:uccp_gram_base: request_mem_region failed\n",
 			       hal_name);
-
-			kfree(hpriv);
-			return -ENOMEM;
+			err = -ENOMEM;
+			goto free_host_ram;
 		}
 
 		hpriv->gram_b4_addr =
 			(unsigned long)devm_ioremap(dev, hpriv->uccp_gram_base,
 					       hpriv->uccp_gram_len);
 
-		if (hpriv->gram_b4_addr == 0) {
+		if (!hpriv->gram_b4_addr) {
 			pr_err("%s: Ioremap failed for UCCP mem region\n",
 				hal_name);
-
-			release_mem_region(hpriv->uccp_gram_base,
-					   hpriv->uccp_gram_len);
-			kfree(hpriv);
-
-			return -ENOMEM;
+			err = -ENOMEM;
+			goto uccp_gram_release;
 		}
 	}
 
@@ -1647,17 +1627,20 @@ static int hal_init(void *dev)
 	if (chg_irq_register(1)) {
 		pr_err("%s: Unable to register Interrupt handler with kernel\n",
 		       hal_name);
-
-		cleanup_all_resources();
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto uccp_gram_b4_unmap;
 	}
 
 	/*Allocate space do update data pointers to DCP*/
 	hpriv->hal_tx_data = kzalloc((NUM_TX_DESC * NUM_FRAMES_IN_TX_DESC *
 				      sizeof(struct hal_tx_data)), GFP_KERNEL);
 
-	if (!hpriv->hal_tx_data)
-		return -ENOMEM;
+	if (!hpriv->hal_tx_data) {
+		pr_err("%s: hal_tx_data: unable to allocate memory\n",
+		       hal_name);
+		err = -ENOMEM;
+		goto uccp_gram_b4_unmap;
+	}
 
 	/* Intialize HAL tasklets */
 	tasklet_init(&hpriv->tx_tasklet,
@@ -1689,10 +1672,40 @@ static int hal_init(void *dev)
 
 	hpriv->cmd_cnt = COMMAND_START_MAGIC;
 	hpriv->event_cnt = 0;
+
 	return 0;
 
-}
+uccp_gram_b4_unmap:
+	if (hpriv->gram_b4_addr)
+		iounmap((void __iomem *)hpriv->gram_b4_addr);
+uccp_gram_release:
+	if (hpriv->uccp_gram_base)
+		release_mem_region(hpriv->uccp_gram_base,
+				   hpriv->uccp_gram_len);
+free_host_ram:
+	kfree(hpriv->base_addr_uccp_host_ram);
+	hpriv->base_addr_uccp_host_ram = NULL;
+uccp_gram_unmap:
+	iounmap((void __iomem *)hpriv->gram_base_addr);
+uccp_gram_pkd_release:
+	release_mem_region(hpriv->uccp_pkd_gram_base,
+			   hpriv->uccp_pkd_gram_len);
+uccp_perip_unmap:
+	iounmap((void __iomem *)hpriv->uccp_perip_base_addr);
+uccp_perip_release:
+	release_mem_region(hpriv->uccp_perip_base,
+			   hpriv->uccp_perip_len);
+uccp_sysbus_unmap:
+	iounmap((void __iomem *)hpriv->uccp_sysbus_base_addr);
+uccp_sysbus_release:
+	release_mem_region(hpriv->uccp_sysbus_base,
+			   hpriv->uccp_sysbus_len);
+free_hpriv:
+	kfree(hpriv);
+	hpriv = NULL;
 
+	return err;
+}
 
 static void hal_deinit_bufs(void)
 {
@@ -1802,18 +1815,21 @@ static int hal_init_bufs(unsigned int tx_bufs,
 		goto err;
 	}
 
-	rx_max_data_size = MAX_DATA_SIZE_2K;
 
 	for (cmd_count = 0; cmd_count < cmd_buf_count; cmd_count++) {
 		memset(&cmd_rx, 0, sizeof(struct cmd_hal));
 
-		UCCP_DEBUG_HAL("%s: Loop :%d: rx_max_data_size: %d\n",
-			 hal_name, cmd_count, rx_max_data_size);
 
 		for (count = 0; count < MAX_RX_BUF_PTR_PER_CMD; count++,
 		     pkt_desc++) {
+
 			if (pkt_desc < hpriv->rx_bufs_12k)
 				rx_max_data_size = MAX_DATA_SIZE_12K;
+			else
+				rx_max_data_size = MAX_DATA_SIZE_2K;
+
+			UCCP_DEBUG_HAL("%s: Loop :%d: rx_max_data_size: %d\n",
+				 hal_name, cmd_count, rx_max_data_size);
 
 			result = init_rx_buf(pkt_desc,
 					     rx_max_data_size,
@@ -1911,8 +1927,11 @@ int hal_map_tx_buf(int pkt_desc, int frame_id, unsigned char *data, int len)
 			     (index * hpriv->max_data_size);
 
 		memcpy(tx_address, data, len);
-	} else
+		alloc_skb_priv_tx_region++;
+	} else {
 		tx_address = data;
+		alloc_skb_dma_region++;
+	}
 
 	dma_buf = dma_map_single(NULL,
 				 tx_address,
@@ -2039,7 +2058,7 @@ static int init_rx_buf(int pkt_desc,
 		}
 
 		hpriv->rx_buf_info[pkt_desc].dma_buf_priv = 1;
-		alloc_skb_priv_region++;
+		alloc_skb_priv_rx_region++;
 	}
 
 	*dma_buf = dma_map_single(NULL,
