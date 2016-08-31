@@ -1125,19 +1125,19 @@ int uccp420wlan_tx_free_buff_req(struct mac80211_dev *dev,
 				unsigned int ldelta = 0;
 				int ets_band;
 				int bts_vif = uvif->vif_index;
-				struct wifi_sync sync =
-						dev->params->sync[bts_vif];
+				struct wifi_sync *sync =
+						&dev->params->sync[bts_vif];
 #ifdef MULTI_CHAN_SUPPORT
 				ets_band = get_band_chanctx(dev, uvif);
 #endif
 				spin_lock(&tsf_lock);
-				sync.status = 1;
-				ether_addr_copy(sync.bssid,
+				sync->status = 1;
+				ether_addr_copy(sync->bssid,
 					ivif->bss_conf.bssid);
-				memcpy(sync.ts1, tx_done->reserved, 8);
-				memcpy(&sync.ts2, (tx_done->reserved + 8), 4);
-				ts2 = sync.ts2;
-				sync.atu = 0;
+				memcpy(sync->ts1, tx_done->reserved, 8);
+				memcpy(&sync->ts2, (tx_done->reserved + 8), 4);
+				ts2 = sync->ts2;
+				sync->atu = 0;
 
 				if (ets_band == IEEE80211_BAND_2GHZ)
 					ldelta = BTS_AP_24GHZ_ETS;
@@ -1145,8 +1145,8 @@ int uccp420wlan_tx_free_buff_req(struct mac80211_dev *dev,
 					ldelta = BTS_AP_5GHZ_ETS;
 
 				if (frc_to_atu) {
-					frc_to_atu(ts2, &sync.atu, 0);
-					sync.atu += ldelta * 1000;
+					frc_to_atu(ts2, &sync->atu, 0);
+					sync->atu += ldelta * 1000;
 				}
 				spin_unlock(&tsf_lock);
 			}
