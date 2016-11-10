@@ -171,11 +171,56 @@ static void get_rate(struct sk_buff *skb,
 	int prot_type;
 	unsigned char nss = 1;
 	bool all_rates_invalid = true;
+
+	/* production test*/
+	if (dev->params->production_test == 1) {
+		index = 0;
+		if (dev->params->tx_fixed_mcs_indx != -1) {
+			txcmd->rate[index] = 0x80;
+			txcmd->rate[index] |=
+			    (dev->params->tx_fixed_mcs_indx);
+			txcmd->num_spatial_streams[index] =
+			    dev->params->num_spatial_streams;
+			txcmd->bcc_or_ldpc =
+			    dev->params->prod_mode_bcc_or_ldpc;
+			txcmd->stbc_enabled =
+			    dev->params->prod_mode_stbc_enabled;
+			update_mcs_packet_stat(
+			    dev->params->tx_fixed_mcs_indx,
+			    txcmd->rate_flags[index], dev);
+		} else if (dev->params->production_test == 1 &&
+			   dev->params->tx_fixed_rate != -1) {
+			txcmd->rate[index] = 0x00;
+			if (dev->params->tx_fixed_rate == 55)
+				txcmd->rate[index] |=
+				 ((dev->params->tx_fixed_rate) /
+				  5);
+			else
+				txcmd->rate[index] |=
+				  ((dev->params->tx_fixed_rate *
+				    10) / 5);
+			txcmd->num_spatial_streams[index] = 1;
+			txcmd->bcc_or_ldpc = 0;
+			txcmd->stbc_enabled = 0;
+		}
+		txcmd->num_rates = 1;
+		txcmd->rate_retries[index] = 1;
+		txcmd->rate_flags[index] =
+			dev->params->prod_mode_rate_flag;
+		txcmd->rate_preamble_type[index] =
+			dev->params->prod_mode_rate_preamble_type;
+		return;
+	}
+
 	/* Normal Mode*/
 	rate = ieee80211_get_tx_rate(dev->hw, c);
 	min_rate = dev->hw->wiphy->bands[c->band]->bitrates[0].hw_value;
 
 	if (rate == NULL) {
+		UCCP_DEBUG_IF("%s:%d rate is null taking defaults: min: %d\n",
+			      __func__,
+			      __LINE__,
+			      c->control.rates[0].idx);
 		txcmd->num_rates = 1;
 		txcmd->rate[0] = min_rate;
 		txcmd->rate_retries[0] = 5;
@@ -184,6 +229,7 @@ static void get_rate(struct sk_buff *skb,
 		txcmd->num_spatial_streams[0] = 1;
 		txcmd->bcc_or_ldpc = 0;
 		txcmd->stbc_enabled = 0;
+		txcmd->rate_flags[0] = 0;
 		return;
 	}
 
@@ -214,49 +260,6 @@ static void get_rate(struct sk_buff *skb,
 		txcmd->num_rates++;
 		txcmd->num_spatial_streams[index] = 1;
 
-		/* production test*/
-		if (dev->params->production_test == 1 &&
-		    dev->params->tx_fixed_mcs_indx != -1) {
-			txcmd->rate_preamble_type[index] =
-				dev->params->prod_mode_rate_preamble_type;
-			txcmd->rate_flags[index] =
-				dev->params->prod_mode_rate_flag;
-			txcmd->rate[index] = 0x80;
-			txcmd->rate[index] |=
-			    (dev->params->tx_fixed_mcs_indx);
-			txcmd->num_spatial_streams[index] =
-			    dev->params->num_spatial_streams;
-			txcmd->bcc_or_ldpc =
-			    dev->params->prod_mode_bcc_or_ldpc;
-			txcmd->stbc_enabled =
-			    dev->params->prod_mode_stbc_enabled;
-			update_mcs_packet_stat(
-			    dev->params->tx_fixed_mcs_indx,
-			    txcmd->rate_flags[index], dev);
-			txcmd->num_rates++;
-			break;
-		} else if (dev->params->production_test == 1 &&
-			   dev->params->tx_fixed_rate != -1) {
-			txcmd->rate_preamble_type[index] =
-				dev->params->prod_mode_rate_preamble_type;
-			txcmd->rate_flags[index] =
-				dev->params->prod_mode_rate_flag;
-
-			txcmd->rate[index] = 0x00;
-			if (dev->params->tx_fixed_rate == 55)
-				txcmd->rate[index] |=
-				 ((dev->params->tx_fixed_rate) /
-				  5);
-			else
-				txcmd->rate[index] |=
-				  ((dev->params->tx_fixed_rate *
-				    10) / 5);
-			txcmd->num_spatial_streams[index] = 1;
-			txcmd->bcc_or_ldpc = 0;
-			txcmd->stbc_enabled = 0;
-			txcmd->num_rates++;
-			break;
-		}
 		/* No input from production_test proc, continue and use
 		 * info from mac80211 RC
 		 */
@@ -528,12 +531,13 @@ static void get_rate(struct sk_buff *skb,
 			UCCP_DEBUG_IF("UCCP420_WIFI:invalid rates\n");
 		txcmd->num_rates = 1;
 		txcmd->rate[0] = min_rate;
-		txcmd->rate_retries[0] = 5;
+		txcmd->rate_retries[0] = 4;
 		txcmd->rate_protection_type[0] = USE_PROTECTION_NONE;
 		txcmd->rate_preamble_type[0] = DONT_USE_SHORT_PREAMBLE;
 		txcmd->num_spatial_streams[0] = 1;
 		txcmd->bcc_or_ldpc = 0;
 		txcmd->stbc_enabled = 0;
+		txcmd->rate_flags[0] = 0;
 	}
 }
 
