@@ -125,27 +125,13 @@ static struct ieee80211_channel dsss_chantable[] = {
 	CHAN2G(2484, 13), /* Channel 14 */
 };
 
+/*DFS channel currently not supported in the AP mode*/
+
 static struct ieee80211_channel ofdm_chantable[] = {
 	CHAN5G(5180, 14, 0), /* Channel 36 */
 	CHAN5G(5200, 15, 0), /* Channel 40 */
 	CHAN5G(5220, 16, 0), /* Channel 44 */
 	CHAN5G(5240, 17, 0), /* Channel 48 */
-	CHAN5G(5260, 18, IEEE80211_CHAN_RADAR), /* Channel 52 */
-	CHAN5G(5280, 19, IEEE80211_CHAN_RADAR), /* Channel 56 */
-	CHAN5G(5300, 20, IEEE80211_CHAN_RADAR), /* Channel 60 */
-	CHAN5G(5320, 21, IEEE80211_CHAN_RADAR), /* Channel 64 */
-	CHAN5G(5500, 22, IEEE80211_CHAN_RADAR), /* Channel 100 */
-	CHAN5G(5520, 23, IEEE80211_CHAN_RADAR), /* Channel 104 */
-	CHAN5G(5540, 24, IEEE80211_CHAN_RADAR), /* Channel 108 */
-	CHAN5G(5560, 25, IEEE80211_CHAN_RADAR), /* Channel 112 */
-	CHAN5G(5580, 26, IEEE80211_CHAN_RADAR), /* Channel 116 */
-	CHAN5G(5600, 27, IEEE80211_CHAN_RADAR), /* Channel 120 */
-	CHAN5G(5620, 28, IEEE80211_CHAN_RADAR), /* Channel 124 */
-	CHAN5G(5640, 29, IEEE80211_CHAN_RADAR), /* Channel 128 */
-	CHAN5G(5660, 30, IEEE80211_CHAN_RADAR), /* Channel 132 */
-	CHAN5G(5680, 31, IEEE80211_CHAN_RADAR), /* Channel 136 */
-	CHAN5G(5700, 32, IEEE80211_CHAN_RADAR), /* Channel 140 */
-	CHAN5G(5720, 33, IEEE80211_CHAN_RADAR), /* Channel 144 */
 	CHAN5G(5745, 34, 0), /* Channel 149 */
 	CHAN5G(5765, 35, 0), /* Channel 153 */
 	CHAN5G(5785, 36, 0), /* Channel 157 */
