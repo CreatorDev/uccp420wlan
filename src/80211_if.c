@@ -547,11 +547,6 @@ static int start(struct ieee80211_hw *hw)
 
 	UCCP_DEBUG_80211IF("%s-80211IF: In start\n", dev->name);
 
-	if ((wifi->params.fw_loading == 1) && load_fw(hw)) {
-		UCCP_DEBUG_80211IF("%s-80211IF: FW load failed\n", dev->name);
-		return -ENODEV;
-	}
-
 	mutex_lock(&dev->mutex);
 	if ((uccp420wlan_core_init(dev, ftm)) < 0) {
 		UCCP_DEBUG_80211IF("%s-80211IF: umac init failed\n", dev->name);
@@ -1462,6 +1457,10 @@ static void init_hw(struct ieee80211_hw *hw)
 #ifdef CONFIG_PM
 	hw->wiphy->wowlan = &uccp_wowlan_support;
 #endif
+
+	if ((wifi->params.fw_loading == 1) && load_fw(hw))
+		UCCP_DEBUG_80211IF("%s-80211IF: FW load failed\n", dev->name);
+
 }
 
 
