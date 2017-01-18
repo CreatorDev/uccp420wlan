@@ -72,6 +72,11 @@
 
 #define RF_PARAMS_SIZE	369
 #define MAX_RF_CALIB_DATA 900
+
+/* AXD */
+#define STREAM_SYNC_MAGIC_NUM 0xCCCCFFFF
+#define AXD_BUF_ADDR 0x3f8000
+
 struct hal_data {
 	unsigned char hal_data[HAL_PRIV_DATA_SIZE];
 } __packed;
@@ -265,6 +270,7 @@ struct umac_event_mac_stats {
 	unsigned int roc_stop;
 	unsigned int roc_complete;
 	unsigned int roc_stop_complete;
+	unsigned int deagg_bufOverFlow_cnt;
 	/* TX related */
 	unsigned int tx_cmd_cnt; /* Num of TX commands received from host */
 	unsigned int tx_done_cnt; /* Num of Tx done events sent to host */
@@ -305,6 +311,9 @@ struct umac_event_mac_stats {
 	unsigned int hal_event_cnt; /* Num of events sent by HAL to the host */
 	unsigned int hal_ext_ptr_null_cnt; /* Num of packets dropped due to lack
 					    * of Ext Ram buffers from host
+					    */
+	unsigned int hal_int_ptr_null_cnt; /* Num of packets droped due to lack
+					    * of internal hal event buffers
 					    */
 
 } __packed;

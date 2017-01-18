@@ -46,6 +46,8 @@
 #include "fwldr.h"
 #include "hal.h"
 #include "hal_hostport.h"
+#include "rpu.h"
+#include "soc.h"
 
 
 #define COMMAND_START_MAGIC 0xDEAD
@@ -74,6 +76,8 @@ unsigned int alloc_skb_priv_rx_region;
 unsigned int alloc_skb_priv_runtime;
 
 static unsigned int uccp_ddr_base;
+static unsigned int phys_64mb;
+static void __iomem *sixfour_mb_base;
 
 #ifdef PERF_PROFILING
 /* The timing markers */
@@ -303,9 +307,9 @@ static int hal_ready(struct hal_priv *priv)
 	unsigned int value = 0;
 
 	/* Check the ACK register bit */
-	value =  readl((void __iomem *)(HOST_TO_UCCP_CORE_CMD_ADDR));
+	value =  readl((void __iomem *)(HOST_TO_MTX_CMD_ADDR));
 
-	if (value & BIT(UCCP_CORE_HOST_INT_SHIFT))
+	if (value & BIT(MTX_HOST_INT_SHIFT))
 		return 0;
 	else
 		return 1;
@@ -363,7 +367,7 @@ static void tx_tasklet_fn(unsigned long data)
 		start_addr += ((priv->gram_mem_addr)-(priv->shm_offset));
 
 		if ((start_addr < priv->gram_mem_addr) ||
-		    (start_addr > (priv->gram_mem_addr + HAL_WLAN_GRAM_LEN))) {
+		    (start_addr > (priv->gram_mem_addr + HAL_UCCP_GRAM_LEN))) {
 			pr_err("%s: Invalid cmd addr 0x%08x, dropping cmd\n",
 			       hal_name, (unsigned int)start_addr);
 			dev_kfree_skb_any(skb);
@@ -377,7 +381,7 @@ static void tx_tasklet_fn(unsigned long data)
 
 		value = (unsigned int) (priv->cmd_cnt);
 		value |= 0x7fff0000;
-		writel(value, (void __iomem *)(HOST_TO_UCCP_CORE_CMD_ADDR));
+		writel(value, (void __iomem *)(HOST_TO_MTX_CMD_ADDR));
 		priv->cmd_cnt++;
 		hal_cmd_sent++;
 
@@ -819,7 +823,7 @@ static irqreturn_t hal_irq_handler(int    irq, void  *p)
 
 	spurious = 0;
 
-	value = readl((void __iomem *)(UCCP_CORE_TO_HOST_CMD_ADDR)) &
+	value = readl((void __iomem *)(MTX_TO_HOST_CMD_ADDR)) &
 		0x7fffffff;
 	if (value == (0x7fff0000 | priv->event_cnt)) {
 #ifdef PERF_PROFILING
@@ -907,9 +911,9 @@ static irqreturn_t hal_irq_handler(int    irq, void  *p)
 	if (!spurious) {
 		/* Clear the uccp interrupt */
 		value = 0;
-		value |= BIT(UCCP_CORE_INT_CLR_SHIFT);
+		value |= BIT(MTX_INT_CLR_SHIFT);
 		writel(*((unsigned long   *)&(value)),
-		(void __iomem *)(HOST_TO_UCCP_CORE_ACK_ADDR));
+		(void __iomem *)(HOST_TO_MTX_ACK_ADDR));
 	} else {
 		pr_warn("%s: Spurious interrupt received\n", hal_name);
 
@@ -942,17 +946,17 @@ static void hal_enable_int(void  *p)
 	unsigned int   value = 0;
 
 	/* Set external pin irq enable for host_irq and uccp_irq */
-	value = readl((void __iomem *)UCCP_CORE_INT_ENAB_ADDR);
-	value |= BIT(UCCP_CORE_INT_IRQ_ENAB_SHIFT);
+	value = readl((void __iomem *)SYS_INT_ENAB_ADDR);
+	value |= BIT(SYS_INT_MTX_IRQ_ENAB_SHIFT);
 
 	writel(*((unsigned long   *)&(value)),
-	       (void __iomem *)(UCCP_CORE_INT_ENAB_ADDR));
+	       (void __iomem *)(SYS_INT_ENAB_ADDR));
 
 	/* Enable raising uccp_int when UCCP_INT = 1 */
 	value = 0;
-	value |= BIT(UCCP_CORE_INT_EN_SHIFT);
+	value |= BIT(MTX_INT_EN_SHIFT);
 	writel(*((unsigned long *)&(value)),
-	       (void __iomem *)(UCCP_CORE_INT_ENABLE_ADDR));
+	       (void __iomem *)(MTX_INT_ENABLE_ADDR));
 }
 
 
@@ -961,16 +965,16 @@ static void hal_disable_int(void  *p)
 	unsigned int value = 0;
 
 	/* Reset external pin irq enable for host_irq and uccp_irq */
-	value = readl((void __iomem *)UCCP_CORE_INT_ENAB_ADDR);
-	value &= ~(BIT(UCCP_CORE_INT_IRQ_ENAB_SHIFT));
+	value = readl((void __iomem *)SYS_INT_ENAB_ADDR);
+	value &= ~(BIT(SYS_INT_MTX_IRQ_ENAB_SHIFT));
 	writel(*((unsigned long   *)&(value)),
-	       (void __iomem *)(UCCP_CORE_INT_ENAB_ADDR));
+	       (void __iomem *)(SYS_INT_ENAB_ADDR));
 
 	/* Disable raising uccp_int when UCCP_INT = 1 */
 	value = 0;
-	value &= ~(BIT(UCCP_CORE_INT_EN_SHIFT));
+	value &= ~(BIT(MTX_INT_EN_SHIFT));
 	writel(*((unsigned long *)&(value)),
-	       (void __iomem *)(UCCP_CORE_INT_ENABLE_ADDR));
+	       (void __iomem *)(MTX_INT_ENABLE_ADDR));
 }
 
 
@@ -1445,8 +1449,30 @@ struct platform_driver img_uccp_driver = {
 	},
 };
 
+static unsigned int hal_get_axd_buf_phy_addr(void)
+{
+	return (phys_64mb + AXD_BUF_ADDR + 0xa0000000);
+}
 
+static int hal_update_axd_timestamps(void)
+{
+	unsigned int *addr = (unsigned int *)HAL_AXD_DATA_START;
+	unsigned long long t;
+	unsigned int ts;
 
+	if (atu_get_cur_timestamps) {
+		if (atu_get_cur_timestamps(&t, &ts) < 0)
+			return -1;
+	} else {
+		return -1;
+	}
+	*addr = STREAM_SYNC_MAGIC_NUM;
+	*(addr + 1) = phys_64mb - (unsigned int)sixfour_mb_base + AXD_BUF_ADDR;
+	*((unsigned long long *)(addr + 2)) = t;
+	*(addr + 4) = ts;
+
+	return 0;
+}
 
 static int hal_deinit(void *dev)
 {
@@ -1485,8 +1511,6 @@ static int hal_init(void *dev)
 	int err = 0;
 	unsigned int value = 0;
 	unsigned char *rpusocwrap;
-	void __iomem *sixfour_mb_base;
-	unsigned int phys_64mb;
 
 	(void) (dev);
 
@@ -1588,7 +1612,6 @@ static int hal_init(void *dev)
 	 * address.
 	 */
 	sixfour_mb_base = get_base_address_64mb(phys_64mb);
-
 
 	rpusocwrap = (unsigned char *)(hpriv->uccp_sysbus_base_addr + 0x38000);
 
@@ -2130,6 +2153,8 @@ struct hal_ops_tag hal_ops = {
 	.get_dump_perip		= hal_get_dump_perip,
 	.get_dump_sysbus	= hal_get_dump_sysbus,
 	.get_dump_len		= hal_get_dump_len,
+	.update_axd_timestamps	= hal_update_axd_timestamps,
+	.get_axd_buf_phy_addr	= hal_get_axd_buf_phy_addr,
 };
 
 #ifdef CONFIG_PM

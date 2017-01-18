@@ -425,13 +425,6 @@ static void get_rate(struct sk_buff *skb,
 			else
 				prot_type = USE_PROTECTION_NONE;
 
-			if (txcmd->aggregate_mpdu == AMPDU_AGGR_ENABLED)
-				prot_type = USE_PROTECTION_RTS;
-
-			if (c->control.rates[index].flags &
-			    IEEE80211_TX_RC_40_MHZ_WIDTH)
-				prot_type = USE_PROTECTION_RTS;
-
 			/*RTS threshold: Check for PSDU length
 			 * Need to add all HW added lenghts to skb,
 			 * sw added lengths are already part of skb->len
@@ -456,10 +449,6 @@ static void get_rate(struct sk_buff *skb,
 				prot_type = USE_PROTECTION_RTS;
 
 		}
-
-		/*No 3rd party device is using this, so disable for now*/
-		if (txcmd->rate_flags[index] & ENABLE_VHT_FORMAT)
-			prot_type = USE_PROTECTION_NONE;
 
 		txcmd->rate_protection_type[index] = prot_type;
 
