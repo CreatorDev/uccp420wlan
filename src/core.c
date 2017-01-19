@@ -1044,6 +1044,7 @@ void uccp420wlan_mac_stats(struct umac_event_mac_stats *mac_stats,
 	dev->stats->rx_circular_buffer_free_cnt =
 		mac_stats->rx_circular_buffer_free_cnt;
 	dev->stats->rx_mic_fail_cnt = mac_stats->rx_mic_fail_cnt;
+	dev->stats->deagg_bufOverFlow_cnt = mac_stats->deagg_bufOverFlow_cnt;
 
 	/* HAL related */
 	dev->stats->hal_cmd_cnt = mac_stats->hal_cmd_cnt;
