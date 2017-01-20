@@ -547,11 +547,6 @@ static int start(struct ieee80211_hw *hw)
 
 	UCCP_DEBUG_80211IF("%s-80211IF: In start\n", dev->name);
 
-	if ((wifi->params.fw_loading == 1) && load_fw(hw)) {
-		UCCP_DEBUG_80211IF("%s-80211IF: FW load failed\n", dev->name);
-		return -ENODEV;
-	}
-
 	mutex_lock(&dev->mutex);
 	if ((uccp420wlan_core_init(dev, ftm)) < 0) {
 		UCCP_DEBUG_80211IF("%s-80211IF: umac init failed\n", dev->name);
@@ -1402,6 +1397,7 @@ static void init_hw(struct ieee80211_hw *hw)
 	ieee80211_hw_set(hw, CONNECTION_MONITOR);
 	ieee80211_hw_set(hw, CHANCTX_STA_CSA);
 	ieee80211_hw_set(hw, SUPPORT_FAST_XMIT);
+	ieee80211_hw_set(hw, SUPPORTS_CLONED_SKBS);
 
 	hw->wiphy->max_scan_ssids = MAX_NUM_SSIDS; /* 4 */
 	 /* Low priority bg scan */
@@ -1462,6 +1458,8 @@ static void init_hw(struct ieee80211_hw *hw)
 #ifdef CONFIG_PM
 	hw->wiphy->wowlan = &uccp_wowlan_support;
 #endif
+	if ((wifi->params.fw_loading == 1) && load_fw(hw))
+		UCCP_DEBUG_80211IF("%s-80211IF: FW load failed\n", dev->name);
 }
 
 
@@ -3279,6 +3277,8 @@ static int proc_read_config(struct seq_file *m, void *v)
 			   (wifi->stats.uccp420_lmac_version[0] - '0'),
 			   (wifi->stats.uccp420_lmac_version[2] - '0'));
 	}
+	seq_printf(m, "rpu_axd_address = %x\n",
+		   hal_ops.get_axd_buf_phy_addr());
 
 	return 0;
 }
@@ -3665,14 +3665,16 @@ static int proc_read_mac_stats(struct seq_file *m, void *v)
 		   wifi->stats.rx_circular_buffer_free_cnt);
 	seq_printf(m, "rx_mic_fail_cnt =%d\n",
 		   wifi->stats.rx_mic_fail_cnt);
-
-	/* HAL related */
-	seq_printf(m, "hal_cmd_cnt  =%d\n",
-		   wifi->stats.hal_cmd_cnt);
-	seq_printf(m, "hal_event_cnt =%d\n",
-		   wifi->stats.hal_event_cnt);
-	seq_printf(m, "hal_ext_ptr_null_cnt =%d\n",
+	/* RPU Frame Drops*/
+	seq_puts(m, "================\n");
+	seq_puts(m, "RPU Frame Drops\n");
+	seq_puts(m, "================\n");
+	seq_printf(m, "rpu_ext_drops =%d\n",
 		   wifi->stats.hal_ext_ptr_null_cnt);
+	seq_printf(m, "rpu_int_drops =%d\n",
+		   wifi->stats.hal_int_ptr_null_cnt);
+	seq_printf(m, "rpu_deagg_drops =%d\n",
+		   wifi->stats.deagg_bufOverFlow_cnt);
 
 	return 0;
 
@@ -4488,6 +4490,8 @@ static ssize_t proc_write_config(struct file *file,
 #endif
 	} else if (param_get_val(buf, "fw_loading=", &val)) {
 		wifi->params.fw_loading = val;
+	} else if (param_get_val(buf, "axd_event=", &val)) {
+		hal_ops.update_axd_timestamps();
 	} else if (param_get_val(buf, "bt_state=", &val)) {
 		if (dev->state != STARTED) {
 			pr_err("Interface is not initialized\n");
@@ -4678,7 +4682,7 @@ static int proc_init(struct proc_dir_entry ***main_dir_entry)
 		wifi->params.max_tx_cmds = MAX_SUBFRAMES_IN_AMPDU_HT;
 	wifi->params.disable_power_save = 0;
 	wifi->params.disable_sm_power_save = 0;
-	wifi->params.rate_protection_type = 0; /* Disable protection by def */
+	wifi->params.rate_protection_type = 1;
 	wifi->params.prod_mode_rate_preamble_type = 1; /* LONG */
 	wifi->params.prod_mode_stbc_enabled = 0;
 	wifi->params.prod_mode_bcc_or_ldpc = 0;

@@ -143,7 +143,7 @@ extern spinlock_t tsf_lock;
 #define CH_PROG_TIMEOUT 500   /* In milli-seconds*/
 #define CH_PROG_TIMEOUT_TICKS msecs_to_jiffies(CH_PROG_TIMEOUT)
 
-#define QUEUE_FLUSH_TIMEOUT  2000   /* Specify delay in milli-seconds*/
+#define QUEUE_FLUSH_TIMEOUT  5000   /* Specify delay in milli-seconds*/
 #define QUEUE_FLUSH_TIMEOUT_TICKS   msecs_to_jiffies(QUEUE_FLUSH_TIMEOUT)
 
 #define TX_DEINIT_TIMEOUT 5000
@@ -498,6 +498,7 @@ struct wifi_stats {
 						   * RX circular buffers
 						   */
 	unsigned int rx_mic_fail_cnt; /* Num of MIC failures */
+	unsigned int deagg_bufOverFlow_cnt; /* RX buffer overflow count */
 
 	/* HAL related */
 	unsigned int hal_cmd_cnt; /* Num of commands received by HAL from the
@@ -507,6 +508,7 @@ struct wifi_stats {
 	unsigned int hal_ext_ptr_null_cnt; /* Num of packets dropped due to lack
 					    * of Ext Ram buffers from host
 					    */
+	unsigned int hal_int_ptr_null_cnt;
 
 	/*RF Calibration Data*/
 	unsigned int rf_calib_data_length;
@@ -826,6 +828,8 @@ __s32 __attribute__((weak)) frc_to_atu(__u32 frccnt, __u64 *patu, s32 dir);
 int __attribute__((weak)) get_evt_timer_freq(unsigned int *mask,
 						unsigned int *num,
 						unsigned int *denom);
+int __attribute__((weak)) atu_get_cur_timestamps(unsigned long long *t,
+						 unsigned int *ts);
 
 int tx_queue_map(int queue);
 int tx_queue_unmap(int queue);
