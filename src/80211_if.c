@@ -1465,7 +1465,9 @@ static void init_hw(struct ieee80211_hw *hw)
 
 static int ampdu_action(struct ieee80211_hw *hw,
 				struct ieee80211_vif *vif,
-				struct ieee80211_ampdu_params *params)
+				enum ieee80211_ampdu_mlme_action action,
+				struct ieee80211_sta *sta,
+				u16 tid, u16 *ssn, u8 buf_size, bool amsdu)
 {
 	int ret = 0;
 	unsigned int val = 0;
@@ -1474,14 +1476,14 @@ static int ampdu_action(struct ieee80211_hw *hw,
 	UCCP_DEBUG_80211IF("%s-80211IF: ampdu action started\n",
 			((struct mac80211_dev *)(hw->priv))->name);
 		/* TODO */
-	switch (params->action) {
+	switch (action) {
 	case IEEE80211_AMPDU_RX_START:
 		{
-		val = params->tid | TID_INITIATOR_AP;
+		val = tid | TID_INITIATOR_AP;
 		dev->tid_info[val].tid_state = TID_STATE_AGGR_START;
-		dev->tid_info[val].ssn = params->ssn;
+		dev->tid_info[val].ssn = *ssn;
 		uccp420wlan_prog_ba_session_data(1,
-						 params->tid,
+						 tid,
 						 &dev->tid_info[val].ssn,
 						 1,
 						 vif->addr,
@@ -1490,10 +1492,10 @@ static int ampdu_action(struct ieee80211_hw *hw,
 		break;
 	case IEEE80211_AMPDU_RX_STOP:
 		{
-		val = params->tid | TID_INITIATOR_AP;
+		val = tid | TID_INITIATOR_AP;
 		dev->tid_info[val].tid_state = TID_STATE_AGGR_STOP;
 		uccp420wlan_prog_ba_session_data(0,
-						 params->tid,
+						 tid,
 						 &dev->tid_info[val].ssn,
 						 1,
 						 vif->addr,
@@ -1502,24 +1504,24 @@ static int ampdu_action(struct ieee80211_hw *hw,
 		break;
 	case IEEE80211_AMPDU_TX_START:
 		{
-		val = params->tid | TID_INITIATOR_STA;
-		ieee80211_start_tx_ba_cb_irqsafe(vif, params->sta->addr, params->tid);
+		val = tid | TID_INITIATOR_STA;
+		ieee80211_start_tx_ba_cb_irqsafe(vif, sta->addr, tid);
 		dev->tid_info[val].tid_state = TID_STATE_AGGR_START;
-		dev->tid_info[val].ssn = params->ssn;
+		dev->tid_info[val].ssn = *ssn;
 		}
 		break;
 	case IEEE80211_AMPDU_TX_STOP_FLUSH:
 	case IEEE80211_AMPDU_TX_STOP_FLUSH_CONT:
 	case IEEE80211_AMPDU_TX_STOP_CONT:
 		{
-		val = params->tid | TID_INITIATOR_STA;
+		val = tid | TID_INITIATOR_STA;
 		dev->tid_info[val].tid_state = TID_STATE_AGGR_STOP;
-		ieee80211_stop_tx_ba_cb_irqsafe(vif, params->sta->addr, params->tid);
+		ieee80211_stop_tx_ba_cb_irqsafe(vif, sta->addr, tid);
 		}
 		break;
 	case IEEE80211_AMPDU_TX_OPERATIONAL:
 		{
-		val = params->tid | TID_INITIATOR_STA;
+		val = tid | TID_INITIATOR_STA;
 		dev->tid_info[val].tid_state = TID_STATE_AGGR_OPERATIONAL;
 		}
 		break;
